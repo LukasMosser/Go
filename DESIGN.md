@@ -160,6 +160,46 @@ to apply `pass` as a coordinate; those partial calls are excluded from the
 table and benchmark token totals. The progress report through call 40
 showed 163,204 input tokens.
 
+#### Ten-game paired comparison
+
+The old benchmark harness was not retained, so this comparison uses one
+reconstructed headless harness for both versions. It loads the compact
+Choice-only source from parent commit `6322135` and the multi-output source
+from this branch. Both use the same game rules, Black heuristic, terminal
+scoring, 600-turn cap, and deterministic Mulberry32 random streams for
+seeds 1–10. Every request in both cohorts resolved to `jev-1.13.0`.
+
+| Seed | Compact Choice-only | Multi-output candidate scoring |
+|------|---------------------|--------------------------------|
+| 1 | Black 81–5.5; 159 turns; captures 1/0; Jev passed 75 times | Jev 43.5–41; 83 turns; captures 3/0; Jev passed 2 times |
+| 2 | Black 81–5.5; 159 turns; captures 3/0; Jev passed 73 times | Black 66–20.5; 137 turns; captures 41/3; Jev passed 14 times |
+| 3 | Black 81–5.5; 159 turns; captures 0/0; Jev passed 76 times | Jev 43.5–43; 83 turns; captures 0/0; Jev passed 6 times |
+| 4 | Black 81–5.5; 159 turns; captures 0/0; Jev passed 76 times | Jev 42.5–42; 81 turns; captures 2/0; Jev passed once |
+| 5 | Black 81–5.5; 159 turns; captures 1/0; Jev passed 75 times | Jev 44.5–41; 81 turns; captures 0/0; Jev passed twice |
+| 6 | Black 81–5.5; 159 turns; captures 0/0; Jev passed 76 times | Jev 48.5–36; 82 turns; captures 0/2; Jev passed once |
+| 7 | Black 81–5.5; 159 turns; captures 0/0; Jev passed 76 times | Jev 46.5–40; 78 turns; captures 0/0; Jev passed once |
+| 8 | Black 81–5.5; 159 turns; captures 1/0; Jev passed 75 times | Jev 45.5–37; 80 turns; captures 0/1; Jev passed once |
+| 9 | Black 81–5.5; 159 turns; captures 0/0; Jev passed 76 times | Jev 45.5–39; 76 turns; captures 0/0; Jev passed once |
+| 10 | Black 81–5.5; 159 turns; captures 0/0; Jev passed 75 times | Jev 53.5–31; 88 turns; captures 0/11; Jev passed once |
+
+Captures are shown as Black/Jev. Compact Choice-only lost all ten games.
+Candidate scoring won nine; its seed-2 loss is a clear tactical failure,
+with Black capturing 41 stones. Average game length fell from 159 to
+86.9 turns. Jev's pass frequency fell from 753/759 API calls to 30/432.
+The mean final score margin from White's perspective moved from −75.5 to
++1.8 points (median +5.0), but this is still a ten-game sample against a
+weak local opponent, not a measure of general Go strength.
+
+The extra evaluation is expensive: compact Choice-only used 582,407 input
+tokens and 270,863 output tokens; candidate scoring used 1,703,197 input
+tokens and 414,574 output tokens. The new version made fewer API calls
+because its games ended sooner, but used about 2.9 times as many input
+tokens overall and 5.1 times as many per call on average. The benchmark
+runner was temporary and was deleted after recording these results, in
+keeping with the repository's testing notes; the random generator and
+settings above are recorded so a future retained runner can reproduce the
+comparison.
+
 The local heuristic is also deliberately weak — one-ply greedy, no
 sequence reading, no life-and-death — so the two AIs are comparable in
 strength. Autoplay is a baseline AI benchmark: two limited approaches
@@ -342,6 +382,12 @@ field uses the same five-level rubric: major blunder, poor, playable,
 good, excellent. The Noul output asks whether passing is strategically
 sound.
 
+The output names are `move` for Choice, `pass_ok` for Noul, and
+`quality_<coordinate>` for each Score (for example, `quality_E5` and
+`quality_pass`). TypeSafe returns the expected ordinal score for each
+Score field. This experiment uses that raw value; it has not calibrated
+the rubric or trained the model with DSPy/ReAnchor.
+
 #### Move selection
 
 For each point, the game combines its expected Score with a small log
@@ -349,6 +395,8 @@ prior from the Choice probability. It considers `pass` only when the
 Noul probability is at least 0.5, then selects the highest-utility
 candidate. There is no temperature or sampling. If a required typed
 answer is missing, the request fails and follows the existing retry path.
+This is a one-ply decision: the model scores resulting move effects, but
+the game does not search opponent replies or build an MCTS tree.
 
 #### Error handling
 

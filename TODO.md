@@ -8,11 +8,14 @@
       prior when ranking the per-move Scores.
 - [x] Send exact candidate deltas and benchmark three seeded autoplay
       games; record results and limitations in DESIGN.md.
+- [x] Compare compact Choice-only against multi-output scoring over the
+      same ten deterministic seeds; record per-game outcomes and token
+      usage in DESIGN.md.
 
 ## Next steps
 
-- [ ] Repeat with more paired seeds using a retained benchmark runner so
-      the random streams are exactly reproducible.
+- [ ] Keep a reproducible benchmark runner if this experiment continues;
+      the 10-game runner was temporary and used Mulberry32 seeds 1–10.
 - [ ] Save position-level traces and terminal area margins before trying
       DSPy/ReAnchor calibration.
 
