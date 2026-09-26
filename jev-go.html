@@ -211,21 +211,61 @@ const Jev = (() => {
     ].join('\n');
   }
 
+  function buildEvaluationState(moves) {
+    const effects = moves.map(m => {
+      const captured = [];
+      for (let y = 0; y < N; y++)
+        for (let x = 0; x < N; x++)
+          if (board[y][x] === BLACK && m.board[y][x] === EMPTY) captured.push(coordName(x, y));
+      const own = groupAndLiberties(m.board, m.x, m.y);
+      return coordName(m.x, m.y) + ': place White; capture ' + (captured.join(',') || 'none') +
+        '; resulting connected group has ' + own.libs + ' liberties.';
+    });
+    return [
+      buildState(),
+      'Move quality scale: 0=major blunder, 1=poor, 2=playable, 3=good, 4=excellent. Judge from White’s perspective; consider tactics, group safety, territory, and the whole position.',
+      'Each point outcome below is the exact rules-engine delta from the board above: place White at the named point and remove the listed captured Black stones.',
+      'Candidate point outcomes:',
+      effects.join('\n'),
+      'pass: leave the board unchanged and give Black the next turn.',
+    ].join('\n');
+  }
+
   async function query(moves) {
     const criteria = {};
     for (const m of moves) criteria[coordName(m.x, m.y)] = null;
     criteria.pass = null;
-    const stateStr = buildState();
+    const stateStr = buildEvaluationState(moves);
+    const questions = {
+      move: {
+        type: 'choice',
+        instructions: 'Choose White’s strongest legal point. Save groups in atari, capture opponent groups, build territory, and keep groups connected. Pass only when the position is settled; two consecutive passes end the game.',
+        criteria,
+      },
+      pass_ok: {
+        type: 'noul',
+        instructions: 'Is passing now a strategically sound move for White?',
+        criteria: {
+          true: 'The position is settled or no meaningful White play remains; passing is preferable to playing a harmful or unnecessary move.',
+          false: 'There is still a useful point to play, a group to save, a capture to make, or territory to build or reduce.',
+        },
+      },
+    };
+    const scoreCriteria = ['Major blunder', 'Poor', 'Playable', 'Good', 'Excellent'];
+    const allCandidates = moves.map(m => ({ name: coordName(m.x, m.y), move: m }));
+    allCandidates.push({ name: 'pass', move: null });
+    for (const candidate of allCandidates) {
+      const field = 'quality_' + candidate.name;
+      questions[field] = {
+        type: 'score',
+        instructions: 'Rate White’s move ' + candidate.name + ' using the shared move-quality scale.',
+        criteria: scoreCriteria,
+      };
+    }
     const body = {
       model: MODEL,
       state: stateStr,
-      questions: {
-        move: {
-          type: 'choice',
-          instructions: 'Choose White’s strongest legal point. Save groups in atari, capture opponent groups, build territory, and keep groups connected. Pass only when the position is settled; two consecutive passes end the game.',
-          criteria,
-        },
-      },
+      questions,
     };
     const ctrl = new AbortController();
     const timeout = setTimeout(() => ctrl.abort(), 10000);
@@ -247,28 +287,56 @@ const Jev = (() => {
     }
     if (!resp.ok) throw new Error('HTTP ' + resp.status);
     const data = await resp.json();
-    const ans = data.answers && data.answers.move;
-    if (!ans || !ans.choice) throw new Error('no choice in response');
-    return { choice: ans.choice, confidence: ans.confidence || 0, probabilities: ans.probabilities || null, state: stateStr };
+    const answers = data.answers || {};
+    const policy = answers.move;
+    const passGate = answers.pass_ok;
+    if (!policy || !policy.choice) throw new Error('no Choice answer in response');
+    if (!passGate || !Number.isFinite(passGate.noul)) throw new Error('no Noul answer for pass gate');
+    const scores = {};
+    for (const candidate of allCandidates) {
+      const field = 'quality_' + candidate.name;
+      const answer = answers[field];
+      if (!answer || answer.type !== 'score' || !Number.isFinite(answer.score)) {
+        throw new Error('no Score answer for ' + candidate.name);
+      }
+      scores[candidate.name] = answer.score;
+    }
+    return {
+      choice: policy.choice,
+      confidence: policy.confidence || 0,
+      probabilities: policy.probabilities || null,
+      passProbability: passGate.noul,
+      scores,
+      usage: data.usage || null,
+      model: data.model || MODEL,
+      state: stateStr,
+    };
   }
 
   async function chooseMove(moves) {
-    // Keep every legal point available: a 9x9 board has at most 81 moves,
-    // plus pass, within TypeSafe Choice's 255-option limit.
+    // Keep every legal point available and ask Jev to score each resulting
+    // move as a separate output. With at most 81 legal points plus pass,
+    // the request has at most 84 outputs: Choice, Noul, and 82 Scores.
     const res = await query(moves);
-    // Play Jev's best option: the highest-probability legal move. No
-    // temperature sampling — Jev plays optimally, not for variety.
-    let picked = res.choice;
-    if (res.probabilities) {
-      const legal = new Set(moves.map(m => coordName(m.x, m.y)));
-      legal.add('pass');
-      const entries = Object.entries(res.probabilities).filter(([k]) => legal.has(k));
-      if (entries.length) {
-        picked = entries.reduce((a, b) => (b[1] > a[1] ? b : a))[0];
-      }
+    const policyProbability = name => {
+      if (res.probabilities && Number.isFinite(res.probabilities[name])) return res.probabilities[name];
+      return res.choice === name ? 1 : 0;
+    };
+    const candidates = moves.map(m => {
+      const name = coordName(m.x, m.y);
+      const probability = policyProbability(name);
+      return { name, score: res.scores[name], probability, utility: res.scores[name] + 0.05 * Math.log(Math.max(probability, 1e-9)) };
+    });
+    const passAllowed = res.passProbability >= 0.5;
+    if (passAllowed) {
+      const probability = policyProbability('pass');
+      candidates.push({ name: 'pass', score: res.scores.pass, probability, utility: res.scores.pass + 0.05 * Math.log(Math.max(probability, 1e-9)) });
     }
+    // The per-move Score is the value estimate. Choice supplies a small log
+    // prior, and Noul prevents an unsupported early pass from winning.
+    const picked = candidates.reduce((best, candidate) => candidate.utility > best.utility ? candidate : best).name;
     jevLastChoice = picked === 'pass' ? null : picked;
-    addLog({ t: Date.now(), ok: true, choice: picked, jevChoice: res.choice, confidence: res.confidence, state: res.state, probabilities: res.probabilities });
+    addLog({ t: Date.now(), ok: true, choice: picked, jevChoice: res.choice, confidence: res.confidence, probabilities: res.probabilities, passProbability: res.passProbability, passAllowed, scores: res.scores, usage: res.usage, model: res.model, state: res.state });
     return picked;
   }
 

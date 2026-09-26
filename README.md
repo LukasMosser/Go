@@ -76,9 +76,10 @@ is included. Run it locally:
 node server.js
 ```
 
-Then open **http://localhost:3000** in your browser. The server picks up
-`TYPESAFE_API_KEY` from its environment automatically (check
-`GET /jevstatus`); you can also press **J** in-game and paste a key from
+Then open **http://localhost:3000** in your browser. The server reads
+`TYPESAFE_API_KEY` or `TYPESAFEAI_API_KEY` from its environment or the
+game folder's `.env` file (check `GET /jevstatus`); you can also press
+**J** in-game and paste a key from
 [console.typesafe.ai](https://console.typesafe.ai). A browser key always
 takes precedence. The key is stored in `localStorage`.
 
@@ -94,6 +95,10 @@ set TYPESAFE_API_KEY=yourkey && node server.js
 # Windows (PowerShell)
 $env:TYPESAFE_API_KEY="yourkey"; node server.js
 ```
+
+For a local `.env` file, put either `TYPESAFE_API_KEY=yourkey` or
+`TYPESAFEAI_API_KEY=yourkey` in the game folder. Hidden files are not
+served by the local web server.
 
 The HUD shows who is playing at all times:
 

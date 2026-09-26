@@ -1,21 +1,20 @@
 # TODO
 
-## Current experiment: compact Jev input
+## Current experiment: Jev multi-output move scoring
 
-- [x] Keep the complete legal point list plus `pass`.
-- [x] Use coordinate names with null Choice descriptions instead of
-      per-move tactical annotations.
-- [x] Compress the state to board, captures, recent moves, komi, and pass
-      count; put the column/row coordinate legend at the end.
-- [x] Remove the misleading mid-game territory estimate and derived
-      group-threat list.
-- [x] Rerun the same three seeded autoplay games and record the result in
-      DESIGN.md.
+- [x] Keep the complete legal point list plus `pass` in a Choice output.
+- [x] Add a same-rubric Score output for each legal move and pass.
+- [x] Add a Noul pass gate and use Choice probabilities as a small policy
+      prior when ranking the per-move Scores.
+- [x] Send exact candidate deltas and benchmark three seeded autoplay
+      games; record results and limitations in DESIGN.md.
 
 ## Next steps
 
-- [ ] Try a compact pass-specific warning while keeping coordinate move
-      criteria null; Jev chose pass on 228 of 230 requests in this run.
+- [ ] Repeat with more paired seeds using a retained benchmark runner so
+      the random streams are exactly reproducible.
+- [ ] Save position-level traces and terminal area margins before trying
+      DSPy/ReAnchor calibration.
 
 ## Done (pushed)
 

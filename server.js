@@ -10,10 +10,6 @@ const path = require("path");
 const PORT = 3000;
 const TS_HOST = "api.typesafe.ai";
 const TS_PATH = "/v1/systemone";
-// Optional: set TYPESAFE_API_KEY to let the server inject the key for
-// development, programmatic use, and testing. A browser-supplied
-// Authorization header always takes precedence.
-const ENV_KEY = process.env.TYPESAFE_API_KEY || "";
 
 const MIME = {
   ".html": "text/html",
@@ -27,9 +23,43 @@ const MIME = {
 
 const ROOT = __dirname;
 
+function readDotEnvApiKey() {
+  try {
+    const lines = fs.readFileSync(path.join(ROOT, ".env"), "utf8").split(/\r?\n/);
+    for (const line of lines) {
+      const match = line.match(/^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$/);
+      if (!match || (match[1] !== "TYPESAFE_API_KEY" && match[1] !== "TYPESAFEAI_API_KEY")) continue;
+      let value = match[2];
+      if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+        value = value.slice(1, -1);
+      } else {
+        value = value.replace(/\s+#.*$/, "").trim();
+      }
+      if (value) return value;
+    }
+  } catch (e) {}
+  return "";
+}
+
+// Environment variables take precedence over .env; a browser-supplied
+// Authorization header still takes precedence over either.
+const ENV_KEY = process.env.TYPESAFE_API_KEY || process.env.TYPESAFEAI_API_KEY || readDotEnvApiKey();
+
 function serveStatic(req, res) {
-  let url = req.url === "/" ? "/jev-go.html" : req.url.split("?")[0];
-  const file = path.join(ROOT, path.normalize(url).replace(/^(\.\.[\/\\])+/, ""));
+  const url = req.url === "/" ? "/jev-go.html" : req.url.split("?")[0];
+  let file;
+  try {
+    file = path.resolve(ROOT, "." + decodeURIComponent(url));
+  } catch (e) {
+    file = "";
+  }
+  const relative = file ? path.relative(ROOT, file) : "";
+  const hidden = relative.split(path.sep).some(part => part.startsWith("."));
+  if (!file || !relative || relative === ".." || relative.startsWith(".." + path.sep) || path.isAbsolute(relative) || hidden) {
+    res.writeHead(404, { "Content-Type": "text/plain" });
+    res.end("404 Not Found");
+    return;
+  }
   fs.readFile(file, (err, data) => {
     if (err) {
       res.writeHead(404, { "Content-Type": "text/plain" });

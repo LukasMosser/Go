@@ -121,6 +121,45 @@ the annotated prompt, but the playing result was substantially worse.
 The null-described choices were accepted by the API, so the pass behavior
 is a model/prompt outcome rather than a request validation failure.
 
+#### Multi-output candidate scoring experiment
+
+On branch `codex/jev-candidate-scores`, each request asks Jev for a
+`Choice` distribution over all legal moves, a `Noul` judgment on whether
+passing is strategically sound, and one `Score` for every legal move plus
+pass. The state adds each point move's exact delta from the current board:
+the placed coordinate, captured Black stones, and the resulting White
+group's liberty count. The shared Score rubric is 0–4 (major blunder to
+excellent). This produces at most 84 outputs on an empty 9x9 board.
+
+The game chooses the legal action with the highest
+`Score + 0.05 * ln(max(Choice probability, 1e-9))`. Pass is considered
+only when Jev's Noul probability for “passing is strategically sound” is
+at least 0.5. The Score evaluates each move, Choice contributes a small
+policy prior, and Noul gates pass.
+
+| Seed | Result | Turns | Captures (Black/Jev) | Jev passes | API calls |
+|------|--------|-------|---------------------|------------|-----------|
+| 1 | Jev wins 46.5–39 | 82 | 0/1 | 1 | 41 |
+| 2 | Jev wins 43.5–43 | 83 | 1/0 | 4 | 41 |
+| 3 | Black wins 48–36.5 | 93 | 1/0 | 14 | 46 |
+
+Jev won two of the three games. Across these games it passed 19 times in
+128 API calls, versus 228 passes in 230 calls in the compact-input run.
+The benchmark used 499,701 input tokens and 121,594 output tokens; the
+API resolved `jev-latest` to `jev-1.13.0`. A separate empty-board request
+validated all 84 output fields and used 7,337 input and 1,919 output
+tokens.
+
+These results are promising but exploratory. The old benchmark runner was
+temporary and is not in the repository, so the new runner reused seed
+labels 1–3 but its exact pseudorandom sequence could not be verified as
+identical to the previous run. The sample is also only three games against
+the deliberately simple local heuristic. One initial runner attempt
+stopped after the 41st API response because the temporary harness tried
+to apply `pass` as a coordinate; those partial calls are excluded from the
+table and benchmark token totals. The progress report through call 40
+showed 163,204 input tokens.
+
 The local heuristic is also deliberately weak — one-ply greedy, no
 sequence reading, no life-and-death — so the two AIs are comparable in
 strength. Autoplay is a baseline AI benchmark: two limited approaches
@@ -262,7 +301,8 @@ text. There is no fallback to the local heuristic.
 - **Endpoint**: `POST /jev` (proxied) or `POST
   https://api.typesafe.ai/v1/systemone` (direct)
 - **Model**: `jev-latest`
-- **Question**: one `Choice` question named `move`
+- **Outputs**: one `Choice`, one `Noul`, and a `Score` for each legal
+  point plus pass (up to 84 outputs on a 9x9 board)
 - **Fetch timeout**: 10s via `AbortController`
 - **Retry**: on error or timeout, `jevMove` retries up to 3 times (1s
   between attempts). If all retries fail, an error message is shown and
@@ -270,7 +310,8 @@ text. There is no fallback to the local heuristic.
 
 #### State sent to Jev
 
-`buildState()` assembles a compact text description:
+`buildEvaluationState()` assembles a compact text description plus
+candidate move deltas:
 
 - Rules and side mapping: White is `X`, Black is `O`, area scoring,
   komi 5.5, and two consecutive passes end the game.
@@ -281,30 +322,33 @@ text. There is no fallback to the local heuristic.
   names identify board intersections.
 
 This experiment omits the derived territory estimate and group-threat
-scan. The board itself is the only position description.
+scan. Each legal point adds its captured-stone coordinates and the
+resulting liberties of the played White group, so Jev can evaluate the
+counterfactual without receiving 81 full successor boards.
 
 #### Candidate move set
 
 Jev receives every legal point. A 9x9 board has at most 81 legal moves;
-the request also includes `pass`, for at most 82 Choice options. This
-keeps distant opening and territory moves available instead of
-shortlisting moves by proximity to existing stones.
+the Choice also includes `pass`, for at most 82 actions. Each action has
+its own Score output, plus the Choice and Noul outputs, for at most 84
+named outputs. This keeps distant opening and territory moves available
+instead of shortlisting moves by proximity to existing stones.
 
 #### Choice criteria
 
-Each criterion is keyed by its coordinate (`E5`) and has a null
-description. `pass` is also included with a null description. The state
-legend and question instructions explain the coordinate labels and pass
-semantics; no move-specific descriptions are sent.
+Choice criteria are keyed by their coordinate (`E5`) and have null
+descriptions; `pass` is also null-described. Each action's separate Score
+field uses the same five-level rubric: major blunder, poor, playable,
+good, excellent. The Noul output asks whether passing is strategically
+sound.
 
 #### Move selection
 
-Jev plays optimally: the game picks the highest-probability legal option
-from the returned distribution (argmax), not a random sample. One
-filter applies first: options that are not legal moves (or `pass`) are
-dropped. If probabilities are missing, Jev's top pick is used as is.
-There is no temperature and no randomness — the same position always
-gets the same move.
+For each point, the game combines its expected Score with a small log
+prior from the Choice probability. It considers `pass` only when the
+Noul probability is at least 0.5, then selects the highest-utility
+candidate. There is no temperature or sampling. If a required typed
+answer is missing, the request fails and follows the existing retry path.
 
 #### Error handling
 
@@ -330,7 +374,7 @@ the TypeSafe API does not send CORS headers:
 | How you open the game | Jev? | Why |
 | --- | --- | --- |
 | `file://` (double-click `jev-go.html`) | No — CORS blocks it | The game tries the API directly with your browser key, but browsers block cross-origin calls from `file://`. Without a key, White is played by the local heuristic. Run `node server.js` to use Jev. |
-| `http://localhost:3000` (`node server.js`) | Yes, if a key exists | The proxy forwards `POST /jev` server-side. The server injects `TYPESAFE_API_KEY` from its environment; a browser key entered with `J` also works and takes precedence. |
+| `http://localhost:3000` (`node server.js`) | Yes, if a key exists | The proxy forwards `POST /jev` server-side. The server reads `TYPESAFE_API_KEY` or `TYPESAFEAI_API_KEY` from its environment or `.env`; a browser key entered with `J` also works and takes precedence. |
 | Hosted (GitHub Pages) | No — CORS blocks it | The game tries the API directly with your browser key, but the API sends no CORS headers (`access-control-allow-origin: null`), so the browser blocks the call. Without a key, White is played by the local heuristic. Run `node server.js` locally to use Jev. |
 
 The HUD in the bottom-right corner reflects this at all times:
@@ -427,9 +471,11 @@ server.js     — local Node.js server + Jev CORS proxy (run: node server.js)
 
 `server.js` serves the static game on port 3000 and proxies `POST /jev`
 to `https://api.typesafe.ai/v1/systemone`, forwarding the browser's
-`Authorization` header or injecting `Bearer TYPESAFE_API_KEY` when the
-browser sent none (a browser key always wins). `GET /jevstatus` reports
-whether a server-side key is present.
+`Authorization` header or injecting the server key when the browser sent
+none (a browser key always wins). The server key may come from either
+`TYPESAFE_API_KEY` or `TYPESAFEAI_API_KEY` in the environment or local
+`.env` file. Hidden files are blocked from static requests.
+`GET /jevstatus` reports whether a server-side key is present.
 
 ### Server lifecycle
 
