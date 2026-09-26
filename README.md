@@ -22,9 +22,10 @@ benchmark, not a strong Go exhibition.
 In the original headless autoplay benchmark (3 games with Jev's move list
 capped at 30), Jev lost all three: 81-5.5, 81-5.5, and 81-5.5 — the
 heuristic captured 240 stones to Jev's 8. In that run, Jev did not pass
-prematurely, and each move included a 1-ply lookahead. A later full legal
-move-list experiment had mixed results; see [DESIGN.md](DESIGN.md) for
-the paired comparison and its limits.
+prematurely, and each move included a 1-ply lookahead. A compact-input
+experiment cut Jev's input tokens per request by roughly 55% but caused it
+to choose `pass` on 228 of 230 API calls; all three games ended in losses.
+See [DESIGN.md](DESIGN.md) for the comparisons and their limits.
 
 A short recap of the rules of Go, with links for learning more, is in
 [GO_RULES.md](GO_RULES.md).
@@ -158,17 +159,15 @@ the server, or press `J` and enter a key.
 
 On each White turn:
 
-1. **State** — the game builds a text description: the board diagram,
-   captures, both players' last moves, komi, and a list of all groups
-   with 1-2 liberties ("Groups in danger") so Jev sees threats.
+1. **State** — the game sends a compact board diagram with captures,
+   recent moves, komi, pass count, and an explicit coordinate legend.
 2. **Candidate set** — Jev sees every legal move on the 9x9 board (up to
    81 points), plus `pass`. This keeps distant opening and territory
    moves available.
 3. **Question** — a single `Choice` question is POSTed to the TypeSafe
    System One API (model `jev-latest`) through the local proxy: one
-   option per candidate move, each annotated with its tactical effects
-   (captures, saves from atari, atari threats, resulting group
-   liberties, group extensions, enemy contact), plus a `pass` option.
+   option per candidate move. Coordinates are the option names and the
+   criteria descriptions are `null`; `pass` is also an option.
 4. **Decision** — Jev returns the chosen point, a probability
    distribution over all options, and a confidence score. No text
    generation — one typed round trip per turn.
@@ -181,7 +180,7 @@ On each White turn:
    heuristic instead.
 
 ```
-board state + group threats → text + all legal moves
+compact board state + all legal move coordinates
             → POST /jev → choice + probabilities + confidence
             → argmax over legal options → White plays
 ```

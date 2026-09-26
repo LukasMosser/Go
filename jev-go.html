@@ -188,190 +188,41 @@ const Jev = (() => {
     if (log.length > LOG_MAX) log.shift();
   }
 
-  function describeMove(m) {
-    const bits = [];
-    if (m.captured > 0) bits.push('captures ' + m.captured + (m.captured === 1 ? ' stone' : ' stones'));
-    // Resulting own group liberties (group safety after the move)
-    const ownG = groupAndLiberties(m.board, m.x, m.y);
-    // Check if this move saves a friendly group from atari
-    for (const [nx, ny] of neighbors(m.x, m.y)) {
-      if (board[ny][nx] === WHITE) {
-        const preG = groupAndLiberties(board, nx, ny);
-        if (preG.libs === 1) {
-          const postG = groupAndLiberties(m.board, nx, ny);
-          bits.push('saves your group at ' + coordName(preG.group[0][0], preG.group[0][1]) + ' from atari (now ' + postG.libs + ' liberties)');
-        }
-      }
-    }
-    // Puts opponent group in atari or captures (already handled above for captures)
-    let atari = false;
-    for (const [nx, ny] of neighbors(m.x, m.y)) {
-      if (m.board[ny][nx] === BLACK) {
-        const g = groupAndLiberties(m.board, nx, ny);
-        if (g.libs === 1) atari = true;
-      }
-    }
-    if (atari) bits.push('puts an opponent group in atari');
-    // Threatens opponent group (reduces to 2 liberties)
-    let threatens = false;
-    for (const [nx, ny] of neighbors(m.x, m.y)) {
-      if (m.board[ny][nx] === BLACK) {
-        const g = groupAndLiberties(m.board, nx, ny);
-        if (g.libs === 2) threatens = true;
-      }
-    }
-    if (threatens) bits.push('reduces an opponent group to 2 liberties');
-    // Always report resulting group liberties so Jev can judge safety
-    if (ownG.libs === 1) bits.push('self-atari (1 liberty after move)');
-    else if (ownG.libs === 2) bits.push('unsafe (2 liberties after move)');
-    else if (ownG.libs === 3) bits.push('3 liberties after move');
-    else bits.push(ownG.libs + ' liberties after move');
-    // Lookahead: simulate opponent's best reply on the resulting board.
-    // This gives Jev a 1-ply forward view: "if I play here, opponent can
-    // capture N / put me in atari / reduce me to 2 liberties".
-    const oppMoves = legalMoves(m.board, BLACK, m.board);
-    if (oppMoves.length) {
-      let oppBestCap = 0, oppAtariYou = false, oppReduceYou = false;
-      for (const om of oppMoves) {
-        if (om.captured > oppBestCap) oppBestCap = om.captured;
-        // Check if opponent's reply puts any White group in atari or 2-liberty danger
-        for (const [ox, oy] of neighbors(om.x, om.y)) {
-          if (om.board[oy][ox] === WHITE) {
-            const wg = groupAndLiberties(om.board, ox, oy);
-            if (wg.libs === 1) oppAtariYou = true;
-            if (wg.libs === 2) oppReduceYou = true;
-          }
-        }
-      }
-      const lookahead = [];
-      if (oppBestCap > 0) lookahead.push('opponent can capture ' + oppBestCap + ' stone' + (oppBestCap === 1 ? '' : 's') + ' in reply');
-      if (oppAtariYou) lookahead.push('opponent can put you in atari in reply');
-      else if (oppReduceYou) lookahead.push('opponent can reduce your group to 2 liberties in reply');
-      if (!lookahead.length) lookahead.push('opponent has no immediate threat in reply');
-      bits.push(lookahead.join('; '));
-    }
-    // Approaches / extends
-    let extendsOwn = false, approachesEnemy = false;
-    for (const [nx, ny] of neighbors(m.x, m.y)) {
-      if (m.board[ny][nx] === WHITE) extendsOwn = true;
-      if (board[ny] && board[ny][nx] === BLACK) approachesEnemy = true;
-    }
-    if (extendsOwn) bits.push('extends your group');
-    if (approachesEnemy) bits.push('contact with enemy');
-    if (!bits.length) {
-      const edge = m.x === 0 || m.x === N - 1 || m.y === 0 || m.y === N - 1;
-      bits.push(edge ? 'edge point' : 'open point');
-    }
-    return coordName(m.x, m.y) + ' — ' + bits.join(', ');
-  }
-
   function boardText() {
     const lines = [];
     for (let y = N - 1; y >= 0; y--) {
       let row = (y + 1) + ' ';
       for (let x = 0; x < N; x++) {
         row += board[y][x] === BLACK ? 'O' : board[y][x] === WHITE ? 'X' : '.';
-        if (x < N - 1) row += ' ';
       }
       lines.push(row);
     }
-    lines.push('  ' + COLS.split('').join(' '));
     return lines.join('\n');
   }
 
-  // Rough territory estimate: stones on board + empty regions surrounded
-  // by one color. Same logic as endGame scoring, but called mid-game to
-  // give Jev a sense of who is ahead.
-  function territoryEstimate() {
-    const seen = new Set();
-    let stonesB = 0, stonesW = 0, terrB = 0, terrW = 0;
-    for (let y = 0; y < N; y++)
-      for (let x = 0; x < N; x++) {
-        if (board[y][x] === BLACK) stonesB++;
-        if (board[y][x] === WHITE) stonesW++;
-      }
-    for (let y = 0; y < N; y++)
-      for (let x = 0; x < N; x++) {
-        if (board[y][x] !== EMPTY || seen.has(x + ',' + y)) continue;
-        const region = [], stack = [[x, y]];
-        seen.add(x + ',' + y);
-        const touch = new Set();
-        while (stack.length) {
-          const [cx, cy] = stack.pop();
-          region.push([cx, cy]);
-          for (const [nx, ny] of neighbors(cx, cy)) {
-            const v = board[ny][nx];
-            if (v === EMPTY) { if (!seen.has(nx + ',' + ny)) { seen.add(nx + ',' + ny); stack.push([nx, ny]); } }
-            else touch.add(v);
-          }
-        }
-        if (touch.size === 1) {
-          const c = [...touch][0];
-          if (c === BLACK) terrB += region.length; else terrW += region.length;
-        }
-      }
-    const scoreB = stonesB + terrB, scoreW = stonesW + terrW + 5.5;
-    return { scoreB, scoreW, stonesB, stonesW, terrB, terrW };
-  }
-
-  function buildState(moves) {
-    // Scan for groups with 1-2 liberties (threats both colors must respond to)
-    const seen = new Set();
-    const threats = [];
-    for (let y = 0; y < N; y++)
-      for (let xx = 0; xx < N; xx++) {
-        if (board[y][xx] === EMPTY || seen.has(xx + ',' + y)) continue;
-        const g = groupAndLiberties(board, xx, y);
-        for (const [gx, gy] of g.group) seen.add(gx + ',' + gy);
-        if (g.libs <= 2) {
-          const color = board[y][xx] === WHITE ? 'your' : 'opponent';
-          const label = g.libs === 1 ? 'atari' : '2 liberties';
-          const stones = g.group.map(c => coordName(c[0], c[1])).join(',');
-          threats.push(color + ' group [' + stones + '] has ' + label + ' (' + g.group.length + ' stone' + (g.group.length === 1 ? '' : 's') + ')');
-        }
-      }
-    const lines = [
-      'Game of Go on a 9x9 board. You are White (X); your opponent is Black (O). You receive komi 5.5.',
-      'Area scoring: at game end each side scores its stones on the board plus empty regions it surrounds alone. Two consecutive passes end the game.',
-      'Captures so far: you ' + captures[WHITE] + ', opponent ' + captures[BLACK] + '.',
-      'Current board (rows 9 at top down to 1, columns A-J):',
+  function buildState() {
+    const lastBlack = passes > 0 ? 'pass' : (lastCoord ? coordName(lastCoord.x, lastCoord.y) : 'none');
+    return [
+      'W=X, B=O; White to play; area scoring; komi 5.5; two consecutive passes end the game.',
+      'Captures W/B: ' + captures[WHITE] + '/' + captures[BLACK] + '; consecutive passes: ' + passes + '; last Black: ' + lastBlack + '; last White: ' + (jevLastChoice || 'none/pass') + '.',
+      'Board (rows 9 to 1; .=empty):',
       boardText(),
-      "Opponent's last move: " + (lastCoord ? coordName(lastCoord.x, lastCoord.y) : 'none (start of game or a pass)'),
-      'Your previous move: ' + (jevLastChoice || 'none yet'),
-    ];
-    // Territory estimate so Jev knows if it is ahead or behind
-    const est = territoryEstimate();
-    const leader = est.scoreW > est.scoreB ? 'you' : est.scoreB > est.scoreW ? 'opponent' : 'neither';
-    lines.push('Approximate score right now — you: ' + est.scoreW + ' (stones ' + est.stonesW + ' + territory ' + est.terrW + ' + komi 5.5), opponent: ' + est.scoreB + ' (stones ' + est.stonesB + ' + territory ' + est.terrB + '). ' + (leader === 'you' ? 'You are ahead — consolidate and defend.' : leader === 'opponent' ? 'You are behind — attack weak opponent groups and fight for territory.' : 'The game is even — play carefully to gain an advantage.'));
-    if (threats.length) {
-      lines.push('Groups in danger:');
-      for (const t of threats) lines.push('  ' + t);
-    }
-    lines.push('There are ' + moves.length + ' candidate moves, listed in the criteria. Choose the strongest point for White. Prioritise saving your groups from atari, capturing opponent groups in atari, and attacking weak opponent groups. On 9x9, group safety is critical — keep your groups connected and do not let them get surrounded. Do not pass while there are still open points on the board — passing gives the opponent a free move and costs you territory.');
-    return lines.join('\n');
+      'Coordinates: columns left-to-right A B C D E F G H J (I omitted); rows bottom-to-top 1-9. Choice labels are intersections; pass skips a turn.',
+    ].join('\n');
   }
 
   async function query(moves) {
     const criteria = {};
-    for (const m of moves) criteria[coordName(m.x, m.y)] = describeMove(m);
-    // Only offer pass when the board is nearly full — passing while there
-    // are open points just gives the opponent a free move.
-    let emptyCount = 0;
-    for (let y = 0; y < N; y++)
-      for (let x = 0; x < N; x++)
-        if (board[y][x] === EMPTY) emptyCount++;
-    if (emptyCount <= 3)
-      criteria.pass = 'skip your turn; if both players pass in a row the game ends and the position is scored';
-    else
-      criteria.pass = 'not recommended — there are still ' + emptyCount + ' open points on the board. Passing gives the opponent a free move. Only pass when the board is settled and all remaining moves would reduce your territory.';
-    const stateStr = buildState(moves);
+    for (const m of moves) criteria[coordName(m.x, m.y)] = null;
+    criteria.pass = null;
+    const stateStr = buildState();
     const body = {
       model: MODEL,
       state: stateStr,
       questions: {
         move: {
           type: 'choice',
-          instructions: 'Which point should White play next? Save groups in atari first, then capture or attack weak opponent groups, then build territory. Avoid self-atari unless it captures. Each option lists its tactical effects.',
+          instructions: 'Choose White’s strongest legal point. Save groups in atari, capture opponent groups, build territory, and keep groups connected. Pass only when the position is settled; two consecutive passes end the game.',
           criteria,
         },
       },

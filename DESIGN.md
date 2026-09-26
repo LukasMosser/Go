@@ -33,7 +33,7 @@ Dedicated Go AI (AlphaGo and its successors) needed deep neural
 networks trained on millions of self-play games plus tree search to
 reach human level; Jev has none of that machinery.
 
-In practice, Jev's Go play shows three patterns:
+In earlier Go runs with tactical annotations, Jev's play showed three patterns:
 
 - **Tactical awareness without strategy.** Jev finds captures and atari
   saves well — these are described in the move criteria and map to
@@ -47,16 +47,11 @@ In practice, Jev's Go play shows three patterns:
   many moves at 0.05–0.15. Jev itself is uncertain in most positions;
   high-confidence picks are almost always captures or atari saves.
 
-The state text includes a territory estimate, group-in-danger scan,
-and a 1-ply heuristic lookahead (each candidate move is annotated with
-the opponent's best reply: capture, atari, liberty reduction, or no
-threat). Passing is discouraged while open points remain. These
-measures fixed the most obvious blunders — Jev no longer passes
-prematurely, and it can see immediate tactical threats before choosing.
-But they do not address the strategic gap: Jev still plays reactively
-rather than building territory, and there is a ceiling on how much
-prompt context can compensate for a model that does not deeply
-understand Go.
+The earlier prompt included a mid-game territory estimate, group-in-danger
+scan, and 1-ply heuristic lookahead in each move description. The current
+compact-input experiment removes those derived annotations to measure
+whether Jev does better with the board, concise metadata, and bare legal
+move coordinates.
 
 #### Original 30-candidate benchmark
 
@@ -99,6 +94,32 @@ completed games. These three trials are mixed: the two completed full-list
 games still lost, while the third did not finish within the runner's
 600-turn limit. Treat the result as exploratory; the API uses the mutable
 `jev-latest` alias and a three-seed sample is small.
+
+#### Compact input experiment
+
+On branch `codex/jev-compact-state`, the complete legal move list remains
+available, but Choice options use coordinate names with null descriptions.
+The state contains a compact board, captures, recent moves, komi, and pass
+count, followed by a coordinate legend. It omits the territory estimate,
+group-threat scan, and per-move lookahead annotations. The benchmark uses
+the same three seeds and API model as the full-list run.
+
+| Seed | Full-list annotated input | Compact state and null criteria |
+|------|---------------------------|---------------------------------|
+| 1 | Black wins 81-5.5; 163 turns; 78/1 captures (Black/Jev) | Black wins 81-5.5; 159 turns; 0/0 captures; Jev chose pass on 76/76 API calls |
+| 2 | Black wins 81-5.5; 187 turns; 88/8 captures | Black wins 81-5.5; 159 turns; 0/0 captures; Jev chose pass on 77/77 API calls |
+| 3 | Did not finish within 600 turns | Black wins 81-5.5; 159 turns; 2/0 captures; Jev chose pass on 75/77 API calls |
+
+The compact prompt completed all three games. Jev chose `pass` on 228 of
+230 API calls (99%), made no captures, and Black won all three; Black
+captured two Jev stones in seed 3. The game also auto-passes if Jev has no
+legal point left, which is separate from those API choices. Across the
+230 calls, Jev used 175,509 input tokens (about 763 per call) and 81,074
+output tokens; the API resolved `jev-latest` to `jev-1.13.0`. For the two
+completed paired seeds, input tokens per call fell by about 54–56% versus
+the annotated prompt, but the playing result was substantially worse.
+The null-described choices were accepted by the API, so the pass behavior
+is a model/prompt outcome rather than a request validation failure.
 
 The local heuristic is also deliberately weak — one-ply greedy, no
 sequence reading, no life-and-death — so the two AIs are comparable in
@@ -251,64 +272,30 @@ text. There is no fallback to the local heuristic.
 
 `buildState()` assembles a compact text description:
 
-- The rules context (9x9, area scoring, komi 5.5, two passes end the
-  game).
-- Captures so far for both sides.
-- The board as text: rows 9 (top) down to 1, columns A–J (no I, as in
-  traditional Go notation), `X` = White, `O` = Black, `.` = empty.
-- The opponent's last move and Jev's own previous move (so it can avoid
-  repeating).
-- **Territory estimate**: a rough area score for both sides (stones +
-  surrounded empty regions + komi), with a "you are ahead / behind /
-  even" judgment. This gives Jev urgency to fight for territory when it
-  is losing, and to consolidate when it is winning.
-- **Groups in danger**: a list of all groups (both colors) with 1–2
-  liberties, with their coordinates and liberty count. This lets Jev
-  see threats before choosing a move.
-- The number of candidate moves and strategic guidance: save groups in
-  atari first, capture or attack weak opponent groups, keep groups
-  connected, avoid getting surrounded, and do not pass while there are
-  still open points on the board.
+- Rules and side mapping: White is `X`, Black is `O`, area scoring,
+  komi 5.5, and two consecutive passes end the game.
+- Captures, consecutive pass count, and the recent move for each side.
+- A compact board with row 9 first and row 1 last; `.` is empty.
+- A coordinate legend at the end of the state: columns left-to-right
+  `A B C D E F G H J` (I omitted), rows bottom-to-top 1–9, and Choice
+  names identify board intersections.
+
+This experiment omits the derived territory estimate and group-threat
+scan. The board itself is the only position description.
 
 #### Candidate move set
 
 Jev receives every legal point. A 9x9 board has at most 81 legal moves;
 the request also includes `pass`, for at most 82 Choice options. This
 keeps distant opening and territory moves available instead of
-shortlisting moves by proximity to existing stones. Each candidate is
-still described using its tactical effects and resulting group
-liberties.
+shortlisting moves by proximity to existing stones.
 
 #### Choice criteria
 
-Each candidate move is a criterion, keyed by its coordinate (`E5`),
-with a tactical annotation computed from the resulting position:
-
-- `captures N stone(s)` — how many stones the move takes
-- `saves your group at X from atari (now N liberties)` — rescues a
-  friendly group that was in atari before the move
-- `puts an opponent group in atari` — leaves an enemy group with one
-  liberty
-- `reduces an opponent group to 2 liberties` — threatens an enemy group
-- `self-atari (1 liberty after move)` / `unsafe (2 liberties after
-  move)` / `3 liberties after move` / `N liberties after move` — always
-  reported so Jev can judge safety of every move
-- `extends your group` — connects to a friendly group
-- `contact with enemy` — adjacent to an enemy stone
-- `edge point` / `open point` — fallback annotation for quiet moves
-- **Lookahead**: each criterion includes the opponent's best reply on
-  the resulting board, simulated with the heuristic. Jev sees "opponent
-  can capture N stones in reply", "opponent can put you in atari in
-  reply", "opponent can reduce your group to 2 liberties in reply", or
-  "opponent has no immediate threat in reply" for every candidate move.
-  This gives Jev a 1-ply forward view without any extra API calls —
-  pure JavaScript, adds negligible latency.
-
-Plus one extra criterion, `pass`. When the board still has more than 3
-empty points, the pass criterion is annotated as "not recommended"
-with a warning that passing gives the opponent a free move. Only when
-the board is nearly settled (≤3 empty points) is pass described
-neutrally, so Jev can end the game.
+Each criterion is keyed by its coordinate (`E5`) and has a null
+description. `pass` is also included with a null description. The state
+legend and question instructions explain the coordinate labels and pass
+semantics; no move-specific descriptions are sent.
 
 #### Move selection
 

@@ -116,21 +116,11 @@ There is no test framework. Tests are throwaway Node scripts using
   HUD (`setHud`), score line, and matchup line show "Jev" or "Local AI"
   for White depending on `Jev.isEnabled()`. `labels()` takes no
   parameters — it checks `Jev.isEnabled()` internally.
-- `chooseMove` receives every legal move. `buildState` describes the
-  complete legal set, and the argmax considers every legal point plus
-  `pass`.
-- `describeMove` always reports the resulting group's liberty count on
-  every move (not just dangerous ones), so Jev can judge safety. It also
-  detects saves from atari, atari threats, 2-liberty threats, group
-  extensions, and enemy contact. Each criterion includes a 1-ply
-  lookahead: the opponent's best reply is simulated with the heuristic
-  and summarized as "opponent can capture N / put you in atari / reduce
-  to 2 liberties / no immediate threat". This is pure JavaScript, no
-  extra Jev calls.
-- `buildState` scans the board for all groups with 1-2 liberties and
-  lists them as "Groups in danger" with coordinates, so Jev sees threats
-  before choosing. It also includes a `territoryEstimate()` — a rough
-  area score (stones + surrounded territory + komi) with an
-  ahead/behind/even judgment — so Jev knows if it should fight or
-  consolidate. Pass is discouraged in the state text and in the pass
-  criterion when more than 3 empty points remain on the board.
+- `chooseMove` receives every legal move. The Choice criteria contain
+  every legal point plus `pass`; `buildState` supplies the compact board
+  and coordinate legend, and the argmax considers the full legal set.
+- Jev's Choice criteria use each legal point's coordinate as the option
+  name and `null` as its description; `pass` is also a null-described
+  option. The compact state carries the board, game metadata, and an
+  explicit coordinate legend. This experiment omits per-move tactical
+  annotations, the danger-group scan, and the mid-game territory estimate.
