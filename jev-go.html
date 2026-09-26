@@ -401,42 +401,15 @@ const Jev = (() => {
     return { choice: ans.choice, confidence: ans.confidence || 0, probabilities: ans.probabilities || null, state: stateStr };
   }
 
-  // Filter legal moves to the most relevant ones so Jev can focus.
-  // Always include: captures, atari saves, moves near existing stones.
-  // Limit to MAX_OPTIONS to avoid overwhelming the decision model.
-  const MAX_OPTIONS = 30;
-  function filterMoves(moves) {
-    if (moves.length <= MAX_OPTIONS) return moves;
-    const scored = moves.map(m => {
-      let s = 0;
-      if (m.captured > 0) s += 1000;
-      // Near existing stones (Manhattan distance ≤ 2)
-      let nearStones = false;
-      for (let dy = -2; dy <= 2; dy++)
-        for (let dx = -2; dx <= 2; dx++) {
-          const nx = m.x + dx, ny = m.y + dy;
-          if (nx < 0 || nx >= N || ny < 0 || ny >= N) continue;
-          if (board[ny][nx] !== EMPTY) nearStones = true;
-        }
-      if (nearStones) s += 100;
-      // Center bias
-      s += 10 - (Math.abs(m.x - 4) + Math.abs(m.y - 4));
-      // Slight randomness for variety
-      s += Math.random() * 5;
-      return { m, s };
-    });
-    scored.sort((a, b) => b.s - a.s);
-    return scored.slice(0, MAX_OPTIONS).map(x => x.m);
-  }
-
   async function chooseMove(moves) {
-    const filtered = filterMoves(moves);
-    const res = await query(filtered);
+    // Keep every legal point available: a 9x9 board has at most 81 moves,
+    // plus pass, within TypeSafe Choice's 255-option limit.
+    const res = await query(moves);
     // Play Jev's best option: the highest-probability legal move. No
     // temperature sampling — Jev plays optimally, not for variety.
     let picked = res.choice;
     if (res.probabilities) {
-      const legal = new Set(filtered.map(m => coordName(m.x, m.y)));
+      const legal = new Set(moves.map(m => coordName(m.x, m.y)));
       legal.add('pass');
       const entries = Object.entries(res.probabilities).filter(([k]) => legal.has(k));
       if (entries.length) {

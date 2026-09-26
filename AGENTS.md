@@ -56,9 +56,9 @@ There is no test framework. Tests are throwaway Node scripts using
   score). Never assert a specific move choice — assert stone counts.
 - Jev mocks: any probabilities work — the game plays the argmax over
   legal options (deterministic, no temperature sampling).
-- `filterMoves` reduces >30 legal moves to 30 candidates (captures,
-  near-stone, center bias) before sending to Jev. When mocking
-  `Jev.chooseMove`, the criteria will only contain filtered moves.
+- Jev receives the complete legal move list. On a 9x9 board there are at
+  most 81 legal points, plus the `pass` option. When mocking
+  `Jev.chooseMove`, criteria include every legal point plus `pass`.
 - `labels()` takes no parameters — White is always Jev.
 - Delete test scripts when done; they are not committed.
 
@@ -116,10 +116,9 @@ There is no test framework. Tests are throwaway Node scripts using
   HUD (`setHud`), score line, and matchup line show "Jev" or "Local AI"
   for White depending on `Jev.isEnabled()`. `labels()` takes no
   parameters — it checks `Jev.isEnabled()` internally.
-- `filterMoves` reduces >30 legal moves to 30 candidates before
-  querying Jev. `chooseMove` receives filtered moves; `buildState` and
-  `describeMove` see the filtered set. The argmax in `chooseMove` only
-  considers filtered moves (plus `pass`).
+- `chooseMove` receives every legal move. `buildState` describes the
+  complete legal set, and the argmax considers every legal point plus
+  `pass`.
 - `describeMove` always reports the resulting group's liberty count on
   every move (not just dangerous ones), so Jev can judge safety. It also
   detects saves from atari, atari threats, 2-liberty threats, group

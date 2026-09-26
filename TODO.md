@@ -16,9 +16,8 @@ Changes made but not yet committed:
 - [x] Group threat scan in state text (`buildState`): lists all groups with
       1-2 liberties (both colors) with their coordinates, so Jev sees what's
       in danger before choosing
-- [x] Move filtering (`filterMoves`): when >30 legal moves, prioritize captures,
-      atari saves, moves near existing stones, and center bias. Jev gets 30
-      focused options instead of 70+ generic ones
+- [x] Replaced the prior 30-move shortlist with every legal move (up to 81
+      points). The paired full-list experiment is recorded in DESIGN.md.
 - [x] Updated question instructions to emphasize group safety and connection
 - [x] Always report resulting liberties on every move (not just dangerous ones)
 

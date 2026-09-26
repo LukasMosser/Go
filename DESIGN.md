@@ -58,10 +58,10 @@ rather than building territory, and there is a ceiling on how much
 prompt context can compensate for a model that does not deeply
 understand Go.
 
-#### Measured results
+#### Original 30-candidate benchmark
 
-Headless autoplay testing (3 games, Jev White vs heuristic Black, with
-all improvements applied):
+The original headless autoplay run capped Jev's candidate list at 30
+moves (3 games, Jev White vs heuristic Black):
 
 | Game | Moves | Score | Heuristic caps | Jev caps | Jev passes |
 |------|-------|-------|----------------|----------|------------|
@@ -77,10 +77,28 @@ threats ("opponent can reduce your group to 2 liberties in reply"), but
 Jev did not change its play pattern in response — it continued placing
 stones adjacent to the opponent rather than claiming open space.
 
-The result is clear: a general-purpose decision model can play legal,
-plausible Go, but cannot match even a simple greedy heuristic at
-strategic play. The improvements (anti-pass, territory estimate,
-lookahead) help at the margins but do not close the strategic gap.
+In this run the heuristic won all three games. These results describe
+this matchup and the 30-candidate implementation; they do not establish
+Jev's general game-playing strength.
+
+#### Full legal move experiment
+
+On branch `codex/jev-full-legal-move-list`, we compared the 30-candidate
+baseline with the full legal move list using the same three heuristic
+seeds and separate random streams for the heuristic and candidate
+filter. The live API resolved `jev-latest` to `jev-1.13.0`.
+
+| Seed | 30-candidate baseline | Full legal move list |
+|------|-----------------------|----------------------|
+| 1 | Black wins 81-5.5; 187 turns; 89/6 captures (Black/Jev) | Black wins 81-5.5; 163 turns; 78/1 captures |
+| 2 | Black wins 81-5.5; 185 turns; 88/5 captures | Black wins 81-5.5; 187 turns; 88/8 captures |
+| 3 | Black wins 81-5.5; 159 turns; 70/0 captures | Did not reach two passes within 600 turns |
+
+The full-list variant sent up to 80 legal points, plus `pass`, in the
+completed games. These three trials are mixed: the two completed full-list
+games still lost, while the third did not finish within the runner's
+600-turn limit. Treat the result as exploratory; the API uses the mutable
+`jev-latest` alias and a three-seed sample is small.
 
 The local heuristic is also deliberately weak — one-ply greedy, no
 sequence reading, no life-and-death — so the two AIs are comparable in
@@ -252,19 +270,14 @@ text. There is no fallback to the local heuristic.
   connected, avoid getting surrounded, and do not pass while there are
   still open points on the board.
 
-#### Move filtering
+#### Candidate move set
 
-When there are more than 30 legal moves, `filterMoves()` reduces the
-options to the 30 most relevant ones before sending them to Jev:
-
-- Captures always included (priority 1000).
-- Moves near existing stones (Manhattan distance ≤ 2) get priority
-  (bonus 100).
-- Center bias (bonus up to 10 by Manhattan distance to center).
-- Slight randomness for variety (bonus 0–5).
-
-This focuses Jev on tactically meaningful moves instead of presenting
-70+ generic options where most are described as "open point".
+Jev receives every legal point. A 9x9 board has at most 81 legal moves;
+the request also includes `pass`, for at most 82 Choice options. This
+keeps distant opening and territory moves available instead of
+shortlisting moves by proximity to existing stones. Each candidate is
+still described using its tactical effects and resulting group
+liberties.
 
 #### Choice criteria
 
@@ -462,7 +475,6 @@ starting the server, or press `J` and enter a key.
 | `MARGIN` | 30 px | Grid inset on the canvas |
 | `CELL` | 51 px | Intersection spacing ((468 − 60) / 8) |
 | `AUTO_DELAY` | 700 ms | Pause between autoplay moves |
-| `MAX_OPTIONS` | 30 | Max candidate moves sent to Jev |
 | `LOG_MAX` | 200 | Jev decision ring-buffer size |
 | fetch timeout | 10000 ms | Jev poll timeout via `AbortController` |
 | retry limit | 3 | Retries on error/timeout before giving up |
