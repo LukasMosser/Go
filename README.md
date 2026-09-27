@@ -9,23 +9,16 @@ a built-in local heuristic AI. You play Black. In autoplay mode, the
 local heuristic drives Black against Jev's White (or against itself if
 no key is set).
 
-Jev is a general-purpose decision model, not a dedicated Go engine.
-It receives a text description of the board and chooses one move per
-turn — no search tree, no playouts, no board evaluation function. Go is
-one of the hardest games for this approach, and Jev plays at roughly
-beginner strength: it understands captures and atari but struggles with
-territory, eye shape, and long-term group safety. The local heuristic is
-also deliberately weak (greedy captures and liberties, no sequence
-reading), so the two are comparable — autoplay is a baseline AI
-benchmark, not a strong Go exhibition.
-
-In the original headless autoplay benchmark (3 games with Jev's move list
-capped at 30), Jev lost all three: 81-5.5, 81-5.5, and 81-5.5 — the
-heuristic captured 240 stones to Jev's 8. In that run, Jev did not pass
-prematurely, and each move included a 1-ply lookahead. A compact-input
-experiment cut Jev's input tokens per request by roughly 55% but caused it
-to choose `pass` on 228 of 230 API calls; all three games ended in losses.
-See [DESIGN.md](DESIGN.md) for the comparisons and their limits.
+Jev is a general-purpose decision model, not a dedicated Go engine. The
+current experiment asks it to score each legal move and combines those
+scores with a move-choice prior and a separate pass judgment. It still
+does no tree search or playouts, and its move evaluation can miss tactical
+sequences: in the ten-game benchmark it won nine games, but one tactical
+failure let Black capture 41 stones. The local opponent is also deliberately
+weak (greedy captures and liberties, no sequence reading), so autoplay is a
+baseline comparison rather than a strong Go exhibition. See the approach,
+replay, and benchmark summary below, and [DESIGN.md](DESIGN.md) for the
+experiment history and per-seed results.
 
 A short recap of the rules of Go, with links for learning more, is in
 [GO_RULES.md](GO_RULES.md).
@@ -162,33 +155,116 @@ the server, or press `J` and enter a key.
 
 ## How it works
 
-On each White turn:
+On every White turn, the game sends one JSON request to the TypeSafe
+System One API (`jev-latest`) through the local proxy. The `state` string
+contains the compact board (`O` black, `X` white, `.` empty), captures,
+pass count, last moves, komi, and a coordinate legend. Columns are
+`A B C D E F G H J` (Go omits I); rows are numbered 1–9 from bottom to
+top. It also lists every legal point's exact immediate rules-engine
+effects: which Black stones it captures and how many liberties White's
+resulting connected group has. The legal move set is complete (up to 81
+points) plus `pass`.
 
-1. **State** — the game sends a compact board diagram with captures,
-   recent moves, komi, pass count, and an explicit coordinate legend.
-2. **Candidate set** — Jev sees every legal move on the 9x9 board (up to
-   81 points), plus `pass`. This keeps distant opening and territory
-   moves available.
-3. **Question** — a single `Choice` question is POSTed to the TypeSafe
-   System One API (model `jev-latest`) through the local proxy: one
-   option per candidate move. Coordinates are the option names and the
-   criteria descriptions are `null`; `pass` is also an option.
-4. **Decision** — Jev returns the chosen point, a probability
-   distribution over all options, and a confidence score. No text
-   generation — one typed round trip per turn.
-5. **Pick** — the game plays the highest-probability legal option from
-   the distribution: Jev's best move, with no randomness.
-6. **Retry** — on timeout (10s) or error, the game retries up to 3
-   times before showing an error message. There is no fallback on low
-   confidence or errors — Jev always plays its best move. The only
-   fallback is when no API key is set: White is played by the local
-   heuristic instead.
+The request's `questions` object asks for three kinds of typed output:
 
+- `move` is a `Choice` over every legal coordinate and `pass`. Option
+  names are coordinates, and their descriptions are `null`.
+- `pass_ok` is a `Noul` judgment on whether passing is strategically
+  sound.
+- Each `quality_<coordinate>` field is a `Score` for that candidate,
+  including `quality_pass`. Its shared rubric is 0–4: major blunder,
+  poor, playable, good, excellent.
+
+Here is the JSON shape (the state text and move list are abbreviated; the
+live request expands them to the current position and every legal move):
+
+```json
+{
+  "model": "jev-latest",
+  "state": "[board, game metadata, coordinate legend, and candidate outcomes]",
+  "questions": {
+    "move": {
+      "type": "choice",
+      "instructions": "Choose White’s strongest legal point. Save groups in atari, capture opponent groups, build territory, and keep groups connected. Pass only when the position is settled; two consecutive passes end the game.",
+      "criteria": { "A1": null, "B2": null, "pass": null }
+    },
+    "pass_ok": {
+      "type": "noul",
+      "instructions": "Is passing now a strategically sound move for White?",
+      "criteria": {
+        "true": "The position is settled or no meaningful White play remains; passing is preferable to playing a harmful or unnecessary move.",
+        "false": "There is still a useful point to play, a group to save, a capture to make, or territory to build or reduce."
+      }
+    },
+    "quality_A1": {
+      "type": "score",
+      "instructions": "Rate White’s move A1 using the shared move-quality scale.",
+      "criteria": ["Major blunder", "Poor", "Playable", "Good", "Excellent"]
+    },
+    "quality_B2": {
+      "type": "score",
+      "instructions": "Rate White’s move B2 using the shared move-quality scale.",
+      "criteria": ["Major blunder", "Poor", "Playable", "Good", "Excellent"]
+    },
+    "quality_pass": {
+      "type": "score",
+      "instructions": "Rate White’s move pass using the shared move-quality scale.",
+      "criteria": ["Major blunder", "Poor", "Playable", "Good", "Excellent"]
+    }
+  }
+}
 ```
-compact board state + all legal move coordinates
-            → POST /jev → choice + probabilities + confidence
-            → argmax over legal options → White plays
+
+An empty 9×9 board produces at most 84 outputs: one `Choice`, one
+`Noul`, and 82 `Score` fields (81 points plus pass). Jev provides a
+numeric score for each candidate and a probability for each `Choice`
+option. The game selects the candidate maximizing
+
+```text
+score + 0.05 × ln(max(choice_probability, 1e-9))
 ```
+
+The `Score` is the main value estimate; the log-probability term gives
+the `Choice` a small prior. `pass` enters that comparison only when the
+`Noul` probability for “passing is strategically sound” is at least 0.5.
+The selected move is deterministic. The browser retries API errors or
+timeouts up to three times; without an API key, White uses the local
+heuristic.
+
+### Replay
+
+This recorded game displays the board and the per-point Jev score heat
+map side by side. Placed stones are shown on the board and set their
+heat-map positions to zero; open points show the score-plus-log-prior
+value with interpolation between intersections. The pass probability is
+shown above the boards.
+
+<video controls preload="metadata" width="100%">
+  <source src="./jev-game-replay.mp4" type="video/mp4">
+  Your browser does not support embedded video. [Open the MP4](jev-game-replay.mp4).
+</video>
+
+### Benchmark
+
+The paired headless benchmark compared the earlier compact `Choice`-only
+prompt against this multi-output candidate scorer. Both cohorts used the
+same reconstructed harness, game rules, local Black heuristic, terminal
+scoring, 600-turn limit, random seeds 1–10, and Jev model release
+`jev-1.13.0`.
+
+| Approach | Jev wins | Average turns | Jev passes / API calls | Input tokens | Output tokens |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Compact `Choice` only | 0/10 | 159.0 | 753 / 759 | 582,407 | 270,863 |
+| Candidate `Score` + `Choice` prior + `Noul` pass gate | 9/10 | 86.9 | 30 / 432 | 1,703,197 | 414,574 |
+
+The mean final score margin from White's perspective changed from −75.5
+to +1.8 points (median +5.0). The candidate scorer's one loss was a
+clear tactical failure: Black won 66–20.5 after capturing 41 stones.
+The evaluation cost more: about 2.9× the total input tokens and 5.1× the
+input tokens per API call. This is an exploratory ten-game result against
+a weak local baseline, not evidence of general Go strength. See the
+[full per-seed table and experiment notes](DESIGN.md#ten-game-paired-comparison)
+for details and limitations.
 
 Press **L** in-game to watch the decisions live. In the browser console,
 `window.jevLog()` returns the last 200 decisions and `window.jevClear()`
