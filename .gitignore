@@ -4,6 +4,7 @@ node_modules/
 # Logs and local dumps
 *.log
 benchmark-results*.jsonl
+.tmp-katago/
 .env
 
 # OS / editor

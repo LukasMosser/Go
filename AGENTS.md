@@ -5,12 +5,12 @@ Notes for coding agents working in this repo. Read this before editing.
 ## What this is
 
 A 9x9 Go game (`jev-go.html`, single file, no dependencies) whose White
-stones are always played by the TypeSafe "System One" decision model
-(Jev) — no fallback to a local heuristic. A local greedy heuristic
-drives Black in autoplay mode. `server.js` is a zero-dependency Node
-proxy that makes Jev work locally. `benchmark.js` runs paired,
-color-balanced rating matches against fixed opponent anchors. See DESIGN.md
-for architecture and README.md for usage.
+moves use Jev-guided MCTS when an API key is available; without a key,
+White uses the local heuristic. API errors do not trigger a heuristic
+fallback. A local greedy heuristic drives Black in autoplay mode.
+`server.js` is a zero-dependency Node proxy that makes Jev work locally.
+`benchmark.js` runs paired, color-balanced rating matches against fixed
+opponent anchors. See DESIGN.md for architecture and README.md for usage.
 
 ## Gotchas
 
@@ -58,8 +58,10 @@ There is no test framework. Tests are throwaway Node scripts using
 - Jev mocks: any probabilities work — the game plays the argmax over
   legal options (deterministic, no temperature sampling).
 - Jev receives the complete legal move list. On a 9x9 board there are at
-  most 81 legal points, plus the `pass` option. When mocking
-  `Jev.chooseMove`, criteria include every legal point plus `pass`.
+  most 81 legal points, plus `pass`. `Jev.chooseMove` is the retained
+  candidate-scoring baseline; `Jev.chooseMctsMove` is the current game policy.
+  MCTS sends one root position, then batches up to four separately labeled
+  leaf positions. Each position asks for Choice, Score, and Noul outputs.
 - `labels()` takes no parameters — White is always Jev.
 - Delete test scripts when done; they are not committed.
 
@@ -117,20 +119,26 @@ There is no test framework. Tests are throwaway Node scripts using
   HUD (`setHud`), score line, and matchup line show "Jev" or "Local AI"
   for White depending on `Jev.isEnabled()`. `labels()` takes no
   parameters — it checks `Jev.isEnabled()` internally.
-- `chooseMove` receives every legal move. The Choice criteria contain
-  every legal point plus `pass`; `buildState` supplies the compact board
-  and coordinate legend, and the argmax considers the full legal set.
-- Jev's Choice criteria use each legal point's coordinate as the option
-  name and `null` as its description; `pass` is also a null-described
-  option. The compact state carries the board, game metadata, and an
-  explicit coordinate legend. Candidate scoring adds exact capture and
-  resulting-liberty annotations to the state, plus one Score per legal
-  point/pass and a Noul pass gate.
+- `chooseMctsMove` is the production Jev policy. It evaluates the root and
+  up to eight search leaves by default, batches four leaves per request,
+  uses PUCT with `c_puct = 1.4`, and picks the most-visited root action.
+  Keep its pass prior soft: multiply Jev's Choice probability by the Noul
+  pass probability and renormalize. A hard Noul threshold was benchmarked
+  and performed worse.
+- MCTS Choice criteria contain every legal coordinate plus `pass`, each
+  with a null description. Each labeled position carries the compact board,
+  captures, pass count, previous move, komi owner, legal list, and coordinate
+  legend. The nine-level Score is indexed 0–8 and maps to
+  `clamp(score / 4 - 1, -1, 1)`; value backup flips perspective each turn.
+  Two-pass leaves use the exact area scorer. `chooseMove` remains a separate
+  candidate-score baseline with move annotations and the existing hard Noul
+  pass threshold; don't conflate its prompt or gating behavior with MCTS.
 
 - The benchmark runner keeps Jev player-relative: when Jev plays actual
   Black, the benchmark swaps board colors and capture counts before asking
-  the same White-oriented prompt. Keep color-swapped games paired by seed,
-  and record the resolved model version and anchor name for every game.
+  the same White-oriented prompt. It must also swap the komi owner in the
+  prompt and terminal value. Keep color-swapped games paired by seed, and
+  record the resolved model version and anchor name for every game.
 
 - For the optional KataGo anchor, `genmove` advances KataGo's GTP board itself;
   only send GTP `play` commands for Jev's moves. Reset board size, komi, rules,

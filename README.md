@@ -10,15 +10,14 @@ local heuristic drives Black against Jev's White (or against itself if
 no key is set).
 
 Jev is a general-purpose decision model, not a dedicated Go engine. The
-current experiment asks it to score each legal move and combines those
-scores with a move-choice prior and a separate pass judgment. It still
-does no tree search or playouts, and its move evaluation can miss tactical
-sequences: in the ten-game benchmark it won nine games, but one tactical
-failure let Black capture 41 stones. The local opponent is also deliberately
-weak (greedy captures and liberties, no sequence reading), so autoplay is a
-baseline comparison rather than a strong Go exhibition. See the approach,
-replay, and benchmark summary below, and [DESIGN.md](DESIGN.md) for the
-experiment history and per-seed results.
+current bot wraps Jev in a small Monte Carlo tree search (MCTS): Jev supplies
+a move policy, a position value, and a pass judgment at each evaluated node.
+The search is shallow and uses no random playouts. In the first paired test,
+MCTS won 4/10 games against the previous Jev score-based policy and 2/10
+against KataGo's human rank-5k profile. It won no games as Black in either
+set, so this experiment is not yet an improvement. See the approach and
+benchmark summary below, and [DESIGN.md](DESIGN.md) for the full experiment
+history and results.
 
 A short recap of the rules of Go, with links for learning more, is in
 [GO_RULES.md](GO_RULES.md).
@@ -155,117 +154,110 @@ the server, or press `J` and enter a key.
 
 ## How it works
 
-On every White turn, the game sends one JSON request to the TypeSafe
-System One API (`jev-latest`) through the local proxy. The `state` string
-contains the compact board (`O` black, `X` white, `.` empty), captures,
-pass count, last moves, komi, and a coordinate legend. Columns are
+On every Jev turn, the game sends the current position and every legal
+coordinate (up to 81 points plus `pass`) to the TypeSafe System One API
+(`jev-latest`) through the local proxy. State text includes the compact
+board (`O` black, `X` white, `.` empty), captures, pass count, last move,
+komi recipient, legal actions, and a coordinate legend. Columns are
 `A B C D E F G H J` (Go omits I); rows are numbered 1–9 from bottom to
-top. It also lists every legal point's exact immediate rules-engine
-effects: which Black stones it captures and how many liberties White's
-resulting connected group has. The legal move set is complete (up to 81
-points) plus `pass`.
+top. Each Choice option is a coordinate or `pass` with a `null` description.
 
-The request's `questions` object asks for three kinds of typed output:
+The browser performs MCTS around these model outputs:
 
-- `move` is a `Choice` over every legal coordinate and `pass`. Option
-  names are coordinates, and their descriptions are `null`.
-- `pass_ok` is a `Noul` judgment on whether passing is strategically
-  sound.
-- Each `quality_<coordinate>` field is a `Score` for that candidate,
-  including `quality_pass`. Its shared rubric is 0–4: major blunder,
-  poor, playable, good, excellent.
+1. It evaluates the root position with three typed questions: a `Choice`
+   distribution over all legal actions, a `Score` for the current position,
+   and a `Noul` probability that passing is sound.
+2. It selects up to eight leaves using PUCT. Jev's Choice probabilities are
+   the action priors. The Score rubric has nine ordered levels (0–8), from
+   an expected area margin of at most −30 points to at least +30; the
+   expected score is mapped to `[-1, 1]` for tree backup. The pass prior is
+   multiplied by Jev's Noul probability and the action priors are normalized.
+3. It evaluates leaves in batches of four, with each board labeled as its
+   own `POSITION` and its own Choice, Score, and Noul questions. The search
+   value changes sign at each turn. If two passes end the game, the leaf
+   value instead comes from the rules engine's exact area score.
+4. It plays the root action with the most visits (ties use mean value, then
+   prior). The default is eight simulations, batches of four, and `c_puct`
+   1.4. Jev evaluates leaves directly; the search does not use random
+   rollouts.
 
-Here is the JSON shape (the state text and move list are abbreviated; the
-live request expands them to the current position and every legal move):
+The root request has this shape; later requests include up to four separately
+labeled board positions and repeat the three questions for each one:
 
 ```json
 {
   "model": "jev-latest",
-  "state": "[board, game metadata, coordinate legend, and candidate outcomes]",
+  "state": "POSITION 0 — White (X) to play; ... board, komi, legal actions, coordinate legend ...",
   "questions": {
-    "move": {
+    "position_0_policy": {
       "type": "choice",
-      "instructions": "Choose White’s strongest legal point. Save groups in atari, capture opponent groups, build territory, and keep groups connected. Pass only when the position is settled; two consecutive passes end the game.",
+      "instructions": "Choose White’s strongest legal action for POSITION 0.",
       "criteria": { "A1": null, "B2": null, "pass": null }
     },
-    "pass_ok": {
+    "position_0_value": {
+      "type": "score",
+      "instructions": "Estimate White’s eventual area-score margin in POSITION 0.",
+      "criteria": ["~−30 or worse", "~−20", "~−10", "~−3", "~0", "~+3", "~+10", "~+20", "+30 or better"]
+    },
+    "position_0_pass": {
       "type": "noul",
-      "instructions": "Is passing now a strategically sound move for White?",
-      "criteria": {
-        "true": "The position is settled or no meaningful White play remains; passing is preferable to playing a harmful or unnecessary move.",
-        "false": "There is still a useful point to play, a group to save, a capture to make, or territory to build or reduce."
-      }
-    },
-    "quality_A1": {
-      "type": "score",
-      "instructions": "Rate White’s move A1 using the shared move-quality scale.",
-      "criteria": ["Major blunder", "Poor", "Playable", "Good", "Excellent"]
-    },
-    "quality_B2": {
-      "type": "score",
-      "instructions": "Rate White’s move B2 using the shared move-quality scale.",
-      "criteria": ["Major blunder", "Poor", "Playable", "Good", "Excellent"]
-    },
-    "quality_pass": {
-      "type": "score",
-      "instructions": "Rate White’s move pass using the shared move-quality scale.",
-      "criteria": ["Major blunder", "Poor", "Playable", "Good", "Excellent"]
+      "instructions": "Is passing now strategically sound for White?",
+      "criteria": { "true": "The position is settled.", "false": "A useful move remains." }
     }
   }
 }
 ```
 
-An empty 9×9 board produces at most 84 outputs: one `Choice`, one
-`Noul`, and 82 `Score` fields (81 points plus pass). Jev provides a
-numeric score for each candidate and a probability for each `Choice`
-option. The game selects the candidate maximizing
-
-```text
-score + 0.05 × ln(max(choice_probability, 1e-9))
-```
-
-The `Score` is the main value estimate; the log-probability term gives
-the `Choice` a small prior. `pass` enters that comparison only when the
-`Noul` probability for “passing is strategically sound” is at least 0.5.
-The selected move is deterministic. The browser retries API errors or
-timeouts up to three times; without an API key, White uses the local
-heuristic.
+For an empty board, Choice contains at most 82 actions (81 points and pass);
+the request asks for three outputs per evaluated position rather than one
+Score per move. The old candidate-scoring policy remains available in the
+benchmark as `--bot scores` / `jev-scores`. Without an API key, White uses the
+local heuristic.
 
 ### Replay
 
-This recorded game displays the board and the per-point Jev score heat
-map side by side. Placed stones are shown on the board and set their
-heat-map positions to zero; open points show the score-plus-log-prior
-value with interpolation between intersections. The pass probability is
-shown above the boards.
+This historical candidate-scoring replay displays the board and the
+per-point Jev score heat map side by side. It predates MCTS. Placed stones
+are shown on the board and set their heat-map positions to zero; open points
+show the score-plus-log-prior value with interpolation between
+intersections. The pass probability is shown above the boards.
 
 <video controls preload="metadata" width="100%">
   <source src="./jev-game-replay.mp4" type="video/mp4">
   Your browser does not support embedded video. [Open the MP4](jev-game-replay.mp4).
 </video>
 
-### Benchmark
+### MCTS benchmark
 
-The paired headless benchmark compared the earlier compact `Choice`-only
-prompt against this multi-output candidate scorer. Both cohorts used the
-same reconstructed harness, game rules, local Black heuristic, terminal
-scoring, 600-turn limit, random seeds 1–10, and Jev model release
-`jev-1.13.0`.
+The selected soft-prior MCTS run played five paired seeds (10 games per
+opponent), using eight simulations per move, batch size four, and
+`jev-1.13.0`:
 
-| Approach | Jev wins | Average turns | Jev passes / API calls | Input tokens | Output tokens |
+| Opponent | Jev W–D–L | Score rate | Elo Δ (approx. 95% range) | Mean margin | Jev wins as B/W |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Compact `Choice` only | 0/10 | 159.0 | 753 / 759 | 582,407 | 270,863 |
-| Candidate `Score` + `Choice` prior + `Noul` pass gate | 9/10 | 86.9 | 30 / 432 | 1,703,197 | 414,574 |
+| Previous Jev candidate scorer | 4–0–6 | 40% | −70 (−278 to +137) | −9.5 | 0/5, 4/5 |
+| KataGo human-SL `rank_5k` | 2–0–8 | 20% | −241 (−488 to +7) | −19.8 | 0/5, 2/5 |
 
-The mean final score margin from White's perspective changed from −75.5
-to +1.8 points (median +5.0). The candidate scorer's one loss was a
-clear tactical failure: Black won 66–20.5 after capturing 41 stones.
-The evaluation cost more: about 2.9× the total input tokens and 5.1× the
-input tokens per API call. This is an exploratory ten-game result against
-a weak local baseline, not evidence of general Go strength. See the
-[full per-seed table and experiment notes](DESIGN.md#ten-game-paired-comparison)
-for details and limitations. The color-balanced Elo runner and opponent
-anchor definitions are documented in [BENCHMARK.md](BENCHMARK.md).
+Against the score-based baseline, Jev used 657 API calls (2,685,667 input
+tokens; 985,745 output tokens). Against KataGo it used 660 calls (2,388,582
+input tokens; 1,022,429 output tokens). Every game was color-swapped, but
+MCTS won no game as Black; this strong color asymmetry and the small sample
+make the result an initial diagnostic, not a stable rating. The search did
+not improve on the old Jev policy in this run. Full paired results and
+limitations are in [DESIGN.md](DESIGN.md#jev-guided-mcts-experiment); runner
+options and KataGo setup are in [BENCHMARK.md](BENCHMARK.md).
+
+I also tested a hard pass gate that removed `pass` from a node whenever
+Noul was below 0.5. It reduced Jev's passes and produced longer games, but
+scored worse: 3–7 (mean margin −18.3) against the score baseline and 0–10
+(−50.1) against KataGo. The soft-prior version remains the default because
+it performed better in these paired runs. Both variants lost every game as
+Black, which remains an open issue.
+
+The earlier ten-game candidate-scoring comparison is historical context: it
+won 9/10 against the deliberately weak local greedy baseline, including one
+tactical loss where Black captured 41 stones. That result is not directly
+comparable to the stronger color-swapped anchors above.
 
 ### Benchmark against KataGo
 
@@ -278,11 +270,12 @@ curl -fL 'https://github.com/lightvector/KataGo/releases/download/v1.15.0/b18c38
   -o ~/.local/share/katago/models/b18c384nbt-humanv0.bin.gz
 ```
 
-With `TYPESAFE_API_KEY` in the environment or the repository's `.env`, run ten
-color-swapped pairs (20 games) against KataGo's `rank_5k` human-SL profile:
+With `TYPESAFE_API_KEY` in the environment or the repository's `.env`, run five
+color-swapped pairs (10 games) against KataGo's `rank_5k` human-SL profile:
 
 ```sh
-node benchmark.js --pairs 10 --opponents katago-5k
+node benchmark.js --bot mcts --mcts-simulations 8 --mcts-batch-size 4 \
+  --pairs 5 --seed 1 --opponents katago-5k
 ```
 
 The runner uses the installed Homebrew model/config, 9×9, 5.5 komi, Chinese

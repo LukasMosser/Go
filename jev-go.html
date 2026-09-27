@@ -60,6 +60,7 @@ const EMPTY = 0, BLACK = 1, WHITE = 2;
 const MARGIN = 30, CELL = (468 - 2 * MARGIN) / (N - 1);
 
 let board, turn, captures, history, lastMove, lastCoord, jevLastChoice, passes, gameOver;
+let jevKomiColor = WHITE;
 
 function newGame() {
   board = Array.from({ length: N }, () => new Array(N).fill(EMPTY));
@@ -70,6 +71,7 @@ function newGame() {
   lastCoord = null;
   jevLastChoice = null;
   passes = 0;
+  jevKomiColor = WHITE;
   gameOver = false;
   document.getElementById('gameover').style.display = 'none';
   setStatus('Your move — you are Black.');
@@ -157,9 +159,9 @@ function legalMoves(bd, color, koBoard) {
 
 // ---- Jev AI (TypeSafe System One) ----
 // When a TypeSafe API key is available (browser key entered with J, or the
-// server's TYPESAFE_API_KEY injected by server.js), White's moves are chosen
-// by the Jev decision model. Jev always plays — no fallback to the local
-// heuristic. On error or timeout, the game retries and waits.
+// server's TYPESAFE_API_KEY injected by server.js), Jev-guided MCTS chooses
+// White's moves. Without a key the local heuristic plays White; API errors
+// retry and wait rather than substituting a move.
 const Jev = (() => {
   // On localhost (served by server.js), use the proxy. Elsewhere
   // (Pages, file://) go direct to the API — the browser key provides
@@ -170,6 +172,21 @@ const Jev = (() => {
   const MODEL = 'jev-latest';
   const COLS = 'ABCDEFGHJ';
   const LOG_MAX = 200;
+  const MCTS_SIMULATIONS = 8;
+  const MCTS_BATCH_SIZE = 4;
+  const MCTS_C_PUCT = 1.4;
+  const PASS_THRESHOLD = 0.5;
+  const VALUE_CRITERIA = [
+    'Position is almost certainly lost; expected final area margin is about 30 points behind or worse.',
+    'Position is badly behind; expected final area margin is about 20 points behind.',
+    'Position is clearly behind; expected final area margin is about 10 points behind.',
+    'Position is slightly behind; expected final area margin is about 3 points behind.',
+    'Position is approximately even; expected final area margin is near zero.',
+    'Position is slightly ahead; expected final area margin is about 3 points ahead.',
+    'Position is clearly ahead; expected final area margin is about 10 points ahead.',
+    'Position is far ahead; expected final area margin is about 20 points ahead.',
+    'Position is almost certainly won; expected final area margin is about 30 points ahead or better.',
+  ];
   const log = [];
 
   let apiKey = '';
@@ -202,8 +219,9 @@ const Jev = (() => {
 
   function buildState() {
     const lastBlack = passes > 0 ? 'pass' : (lastCoord ? coordName(lastCoord.x, lastCoord.y) : 'none');
+    const komiPlayer = jevKomiColor === WHITE ? 'White' : 'Black';
     return [
-      'W=X, B=O; White to play; area scoring; komi 5.5; two consecutive passes end the game.',
+      'W=X, B=O; White to play; area scoring; komi 5.5 for ' + komiPlayer + '; two consecutive passes end the game.',
       'Captures W/B: ' + captures[WHITE] + '/' + captures[BLACK] + '; consecutive passes: ' + passes + '; last Black: ' + lastBlack + '; last White: ' + (jevLastChoice || 'none/pass') + '.',
       'Board (rows 9 to 1; .=empty):',
       boardText(),
@@ -327,7 +345,7 @@ const Jev = (() => {
       const probability = policyProbability(name);
       return { name, score: res.scores[name], probability, utility: res.scores[name] + 0.05 * Math.log(Math.max(probability, 1e-9)) };
     });
-    const passAllowed = res.passProbability >= 0.5;
+    const passAllowed = res.passProbability >= PASS_THRESHOLD;
     if (passAllowed) {
       const probability = policyProbability('pass');
       candidates.push({ name: 'pass', score: res.scores.pass, probability, utility: res.scores.pass + 0.05 * Math.log(Math.max(probability, 1e-9)) });
@@ -340,8 +358,318 @@ const Jev = (() => {
     return picked;
   }
 
+  function copyBoardState(bd) { return bd.map(row => row.slice()); }
+
+  function swapBoardColors(bd) {
+    return bd.map(row => row.map(value => value === BLACK ? WHITE : value === WHITE ? BLACK : value));
+  }
+
+  function mctsStateText(state, index, actions) {
+    const canonical = state.turn === BLACK;
+    const positionBoard = canonical ? swapBoardColors(state.board) : state.board;
+    const positionCaptures = canonical
+      ? { white: state.captures[BLACK], black: state.captures[WHITE] }
+      : { white: state.captures[WHITE], black: state.captures[BLACK] };
+    const positionKomiColor = canonical
+      ? (state.komiColor === WHITE ? BLACK : WHITE)
+      : state.komiColor;
+    const komiPlayer = positionKomiColor === WHITE ? 'White (X)' : 'Black (O)';
+    const lines = [];
+    for (let y = N - 1; y >= 0; y--) {
+      let row = (y + 1) + ' ';
+      for (let x = 0; x < N; x++) {
+        row += positionBoard[y][x] === BLACK ? 'O' : positionBoard[y][x] === WHITE ? 'X' : '.';
+      }
+      lines.push(row);
+    }
+    const previous = state.passes > 0 ? 'pass' : state.lastCoord ? coordName(state.lastCoord.x, state.lastCoord.y) : 'none';
+    const legalNames = actions.map(move => coordName(move.x, move.y));
+    legalNames.push('pass');
+    return [
+      'POSITION ' + index + ' — White (X) to play; Black (O); 9x9 area scoring; komi 5.5 for ' + komiPlayer + '; two consecutive passes end the game.',
+      'Captures W/B: ' + positionCaptures.white + '/' + positionCaptures.black + '; consecutive passes: ' + state.passes + '; previous move: ' + previous + '.',
+      'Board (rows 9 to 1; .=empty):',
+      lines.join('\n'),
+      'Coordinates: columns A B C D E F G H J (I omitted); rows 1-9 from bottom to top.',
+      'Legal actions in this position: ' + legalNames.join(', ') + '.',
+      'Evaluate this labeled position independently. Do not use another POSITION section to answer its questions.',
+    ].join('\n');
+  }
+
+  async function queryMctsPositions(nodes) {
+    const questions = {};
+    const stateText = nodes.map((node, index) => mctsStateText(node.state, index, node.moves)).join('\n\n');
+    nodes.forEach((node, index) => {
+      const criteria = {};
+      for (const move of node.moves) criteria[coordName(move.x, move.y)] = null;
+      criteria.pass = null;
+      questions['position_' + index + '_policy'] = {
+        type: 'choice',
+        instructions: 'For POSITION ' + index + ' only, choose White’s strongest legal action. Prioritize saving groups in atari, capturing, making secure territory, and avoiding self-atari. Pass only when the position is settled.',
+        criteria,
+      };
+      questions['position_' + index + '_value'] = {
+        type: 'score',
+        instructions: 'For POSITION ' + index + ' only, evaluate the whole current board, not any candidate move. Estimate the eventual area-score margin for White if both players continue strong play. Use the ordered score levels as an advantage scale.',
+        criteria: VALUE_CRITERIA,
+      };
+      questions['position_' + index + '_pass'] = {
+        type: 'noul',
+        instructions: 'For POSITION ' + index + ' only: is passing now strategically sound for White?',
+        criteria: {
+          true: 'The position is settled or no meaningful White play remains; passing is preferable to an unnecessary or harmful move.',
+          false: 'There is still a useful move, group to save, capture to make, or territory to build or reduce.',
+        },
+      };
+    });
+
+    const ctrl = new AbortController();
+    const timeout = setTimeout(() => ctrl.abort(), 10000);
+    let response;
+    try {
+      response = await fetch(ENDPOINT, {
+        method: 'POST',
+        headers: {
+          ...(apiKey ? { 'Authorization': 'Bearer ' + apiKey } : {}),
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ model: MODEL, state: stateText, questions }),
+        signal: ctrl.signal,
+      });
+    } catch (error) {
+      throw new Error(error.name === 'AbortError' ? 'timeout' : 'network');
+    } finally {
+      clearTimeout(timeout);
+    }
+    if (!response.ok) throw new Error('HTTP ' + response.status);
+    const data = await response.json();
+    const answers = data.answers || {};
+    const evaluations = nodes.map((node, index) => {
+      const policy = answers['position_' + index + '_policy'];
+      const value = answers['position_' + index + '_value'];
+      const pass = answers['position_' + index + '_pass'];
+      if (!policy || policy.type !== 'choice' || !policy.choice) throw new Error('no Choice answer for MCTS position ' + index);
+      if (!value || value.type !== 'score' || !Number.isFinite(value.score)) throw new Error('no position Score answer for MCTS position ' + index);
+      if (!pass || pass.type !== 'noul' || !Number.isFinite(pass.noul)) throw new Error('no Noul answer for MCTS position ' + index);
+      const legalNames = new Set([...node.moves.map(move => coordName(move.x, move.y)), 'pass']);
+      if (!legalNames.has(policy.choice)) throw new Error('Jev returned a non-legal MCTS action: ' + policy.choice);
+      const probabilities = {};
+      for (const name of legalNames) {
+        const probability = policy.probabilities && Number(policy.probabilities[name]);
+        probabilities[name] = Number.isFinite(probability) ? Math.max(0, probability) : 0;
+      }
+      if (!Object.values(probabilities).some(probability => probability > 0)) probabilities[policy.choice] = 1;
+      const passProbability = Math.max(0, Math.min(1, pass.noul));
+      let priorTotal = 0;
+      for (const name of legalNames) {
+        if (name === 'pass') probabilities[name] *= Math.max(0.001, passProbability);
+        priorTotal += probabilities[name];
+      }
+      if (!(priorTotal > 0)) {
+        const uniform = 1 / legalNames.size;
+        for (const name of legalNames) probabilities[name] = uniform;
+      } else {
+        for (const name of legalNames) probabilities[name] /= priorTotal;
+      }
+      return {
+        choice: policy.choice,
+        confidence: Number(policy.confidence) || 0,
+        probabilities,
+        passProbability,
+        score: value.score,
+        value: Math.max(-1, Math.min(1, value.score / 4 - 1)),
+        valueConfidence: Number(value.confidence) || 0,
+      };
+    });
+    return { evaluations, usage: data.usage || null, model: data.model || MODEL };
+  }
+
+  function createMctsNode(state, moves) {
+    return { state, moves, expanded: false, value: 0, edges: [], visits: 0, virtual: 0 };
+  }
+
+  function expandMctsNode(node, evaluation) {
+    const actions = node.moves.map(move => ({
+      name: coordName(move.x, move.y), move, prior: evaluation.probabilities[coordName(move.x, move.y)] || 0,
+      visits: 0, valueSum: 0, virtual: 0, child: null,
+    }));
+    actions.push({ name: 'pass', move: null, prior: evaluation.probabilities.pass || 0, visits: 0, valueSum: 0, virtual: 0, child: null });
+    node.edges = actions;
+    node.value = evaluation.value;
+    node.confidence = evaluation.valueConfidence;
+    node.policyChoice = evaluation.choice;
+    node.policyConfidence = evaluation.confidence;
+    node.passProbability = evaluation.passProbability;
+    node.expanded = true;
+  }
+
+  function makeMctsChild(node, edge) {
+    const parent = node.state;
+    const nextTurn = parent.turn === BLACK ? WHITE : BLACK;
+    const state = {
+      board: edge.move ? copyBoardState(edge.move.board) : copyBoardState(parent.board),
+      captures: { ...parent.captures },
+      lastMove: edge.move ? copyBoardState(edge.move.board) : null,
+      lastCoord: edge.move ? { x: edge.move.x, y: edge.move.y } : null,
+      passes: edge.move ? 0 : parent.passes + 1,
+      turn: nextTurn,
+      komiColor: parent.komiColor,
+    };
+    if (edge.move) state.captures[parent.turn] += edge.move.captured;
+    const legal = state.passes >= 2 ? [] : legalMoves(state.board, state.turn, state.lastMove);
+    return createMctsNode(state, legal);
+  }
+
+  function selectMctsLeaf(root, reserved) {
+    let node = root;
+    const path = [];
+    while (node.expanded) {
+      if (node.state.passes >= 2) return { node, path, terminalValue: terminalMctsValue(node.state) };
+      const available = node.edges.filter(edge => !edge.child || !reserved.has(edge.child));
+      if (!available.length) return { node, path, terminalValue: node.value };
+      const scale = Math.sqrt(node.visits + node.virtual + 1);
+      let selected = available[0], best = -Infinity;
+      for (const edge of available) {
+        const q = edge.visits ? edge.valueSum / edge.visits : 0;
+        const score = q + MCTS_C_PUCT * edge.prior * scale / (1 + edge.visits + edge.virtual);
+        if (score > best) { best = score; selected = edge; }
+      }
+      node.virtual++;
+      selected.virtual++;
+      if (!selected.child) selected.child = makeMctsChild(node, selected);
+      path.push({ parent: node, edge: selected, child: selected.child });
+      node = selected.child;
+      if (node.state.passes >= 2) return { node, path, terminalValue: terminalMctsValue(node.state) };
+      if (!node.expanded) { reserved.add(node); return { node, path }; }
+    }
+    reserved.add(node);
+    return { node, path };
+  }
+
+  function areaMargin(bd, komiColor) {
+    let black = 0, white = 0;
+    for (const row of bd) for (const cell of row) {
+      if (cell === BLACK) black++;
+      else if (cell === WHITE) white++;
+    }
+    const seen = new Set();
+    for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) {
+      if (bd[y][x] !== EMPTY || seen.has(x + ',' + y)) continue;
+      const stack = [[x, y]], region = [];
+      const borders = new Set();
+      seen.add(x + ',' + y);
+      while (stack.length) {
+        const [cx, cy] = stack.pop();
+        region.push([cx, cy]);
+        for (const [nx, ny] of neighbors(cx, cy)) {
+          const cell = bd[ny][nx];
+          if (cell === EMPTY) {
+            const key = nx + ',' + ny;
+            if (!seen.has(key)) { seen.add(key); stack.push([nx, ny]); }
+          } else borders.add(cell);
+        }
+      }
+      if (borders.size === 1) {
+        const owner = [...borders][0];
+        if (owner === BLACK) black += region.length;
+        else white += region.length;
+      }
+    }
+    if (komiColor === WHITE) white += 5.5;
+    else black += 5.5;
+    return white - black;
+  }
+
+  function terminalMctsValue(state) {
+    const margin = areaMargin(state.board, state.komiColor);
+    const currentMargin = state.turn === WHITE ? margin : -margin;
+    return currentMargin > 0 ? 1 : currentMargin < 0 ? -1 : 0;
+  }
+
+  function backupMcts(path, leaf, leafValue) {
+    leaf.visits++;
+    let value = leafValue;
+    for (let i = path.length - 1; i >= 0; i--) {
+      const step = path[i];
+      step.edge.virtual = Math.max(0, step.edge.virtual - 1);
+      step.parent.virtual = Math.max(0, step.parent.virtual - 1);
+      value = -value;
+      step.edge.visits++;
+      step.edge.valueSum += value;
+      step.parent.visits++;
+    }
+  }
+
+  async function chooseMctsMove(moves, config) {
+    const simulationsBudget = config && Number.isInteger(config.simulations) && config.simulations > 0
+      ? config.simulations : MCTS_SIMULATIONS;
+    const batchSize = config && Number.isInteger(config.batchSize) && config.batchSize > 0
+      ? config.batchSize : MCTS_BATCH_SIZE;
+    const state = {
+      board: copyBoardState(board), captures: { ...captures },
+      lastMove: lastMove ? copyBoardState(lastMove) : null,
+      lastCoord: lastCoord ? { ...lastCoord } : null,
+      passes, turn, komiColor: jevKomiColor,
+    };
+    const root = createMctsNode(state, moves);
+    const usage = { input_tokens: 0, output_tokens: 0 };
+    const models = new Set();
+    let evaluatedPositions = 0;
+    const evaluate = async nodes => {
+      const result = await queryMctsPositions(nodes);
+      evaluatedPositions += nodes.length;
+      const tokens = result.usage || {};
+      usage.input_tokens += Number(tokens.input_tokens || 0);
+      usage.output_tokens += Number(tokens.output_tokens || 0);
+      if (result.model) models.add(result.model);
+      return result.evaluations;
+    };
+
+    expandMctsNode(root, (await evaluate([root]))[0]);
+    let simulations = 0;
+    while (simulations < simulationsBudget) {
+      const count = Math.min(batchSize, simulationsBudget - simulations);
+      const reserved = new Set(), leaves = [], immediate = [];
+      for (let i = 0; i < count; i++) {
+        const selection = selectMctsLeaf(root, reserved);
+        if (selection.terminalValue !== undefined) {
+          backupMcts(selection.path, selection.node, selection.terminalValue);
+          immediate.push(selection.node);
+        } else leaves.push(selection);
+      }
+      if (leaves.length) {
+        const evaluations = await evaluate(leaves.map(item => item.node));
+        leaves.forEach((item, index) => {
+          expandMctsNode(item.node, evaluations[index]);
+          backupMcts(item.path, item.node, evaluations[index].value);
+        });
+      }
+      simulations += leaves.length + immediate.length;
+      if (!leaves.length && !immediate.length) break;
+    }
+
+    const selected = root.edges.reduce((best, edge) => {
+      if (!best || edge.visits > best.visits ||
+        (edge.visits === best.visits && edge.visits && edge.valueSum / edge.visits > best.valueSum / best.visits) ||
+        (edge.visits === best.visits && !edge.visits && edge.prior > best.prior)) return edge;
+      return best;
+    }, null);
+    const picked = selected ? selected.name : root.policyChoice;
+    jevLastChoice = picked === 'pass' ? null : picked;
+    addLog({
+      t: Date.now(), ok: true, choice: picked, jevChoice: root.policyChoice,
+      confidence: root.policyConfidence, probabilities: Object.fromEntries(root.edges.map(edge => [edge.name, edge.prior])),
+      passProbability: root.passProbability, positionValue: root.value, simulations,
+      evaluatedPositions, rootVisits: root.edges.map(edge => ({ move: edge.name, visits: edge.visits })),
+      usage, model: [...models].join(', ') || MODEL, state: mctsStateText(root.state, 0, root.moves),
+      mcts: { simulationsBudget, batchSize, cPuct: MCTS_C_PUCT },
+    });
+    return picked;
+  }
+
   return {
     chooseMove,
+    chooseMctsMove,
     coordName,
     isEnabled() { return !!(apiKey || serverKey); },
     isProxied() { return PROXY; },
@@ -447,7 +775,7 @@ function jevMove(retries) {
   }
   setHud(true);
   setStatus(labels().white + ' (White) is thinking...');
-  Jev.chooseMove(moves).then(sel => {
+  Jev.chooseMctsMove(moves).then(sel => {
     if (gameOver) return;
     if (sel === 'pass') { doPass(WHITE); return; }
     const m = moves.find(mv => Jev.coordName(mv.x, mv.y) === sel);
