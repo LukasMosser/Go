@@ -264,7 +264,31 @@ The evaluation cost more: about 2.9× the total input tokens and 5.1× the
 input tokens per API call. This is an exploratory ten-game result against
 a weak local baseline, not evidence of general Go strength. See the
 [full per-seed table and experiment notes](DESIGN.md#ten-game-paired-comparison)
-for details and limitations.
+for details and limitations. The color-balanced Elo runner and opponent
+anchor definitions are documented in [BENCHMARK.md](BENCHMARK.md).
+
+### Benchmark against KataGo
+
+On macOS, install KataGo and download its human-SL model once:
+
+```sh
+brew install katago
+mkdir -p ~/.local/share/katago/models
+curl -fL 'https://github.com/lightvector/KataGo/releases/download/v1.15.0/b18c384nbt-humanv0.bin.gz' \
+  -o ~/.local/share/katago/models/b18c384nbt-humanv0.bin.gz
+```
+
+With `TYPESAFE_API_KEY` in the environment or the repository's `.env`, run ten
+color-swapped pairs (20 games) against KataGo's `rank_5k` human-SL profile:
+
+```sh
+node benchmark.js --pairs 10 --opponents katago-5k
+```
+
+The runner uses the installed Homebrew model/config, 9×9, 5.5 komi, Chinese
+rules, one visit, and temperature 1. Results go to an ignored JSONL file and
+include model hashes and per-game color/results. See [the benchmark guide](BENCHMARK.md)
+for alternate opponents, path overrides, and rating caveats.
 
 Press **L** in-game to watch the decisions live. In the browser console,
 `window.jevLog()` returns the last 200 decisions and `window.jevClear()`

@@ -8,8 +8,9 @@ A 9x9 Go game (`jev-go.html`, single file, no dependencies) whose White
 stones are always played by the TypeSafe "System One" decision model
 (Jev) — no fallback to a local heuristic. A local greedy heuristic
 drives Black in autoplay mode. `server.js` is a zero-dependency Node
-proxy that makes Jev work locally. See DESIGN.md for architecture and
-README.md for usage.
+proxy that makes Jev work locally. `benchmark.js` runs paired,
+color-balanced rating matches against fixed opponent anchors. See DESIGN.md
+for architecture and README.md for usage.
 
 ## Gotchas
 
@@ -122,5 +123,16 @@ There is no test framework. Tests are throwaway Node scripts using
 - Jev's Choice criteria use each legal point's coordinate as the option
   name and `null` as its description; `pass` is also a null-described
   option. The compact state carries the board, game metadata, and an
-  explicit coordinate legend. This experiment omits per-move tactical
-  annotations, the danger-group scan, and the mid-game territory estimate.
+  explicit coordinate legend. Candidate scoring adds exact capture and
+  resulting-liberty annotations to the state, plus one Score per legal
+  point/pass and a Noul pass gate.
+
+- The benchmark runner keeps Jev player-relative: when Jev plays actual
+  Black, the benchmark swaps board colors and capture counts before asking
+  the same White-oriented prompt. Keep color-swapped games paired by seed,
+  and record the resolved model version and anchor name for every game.
+
+- For the optional KataGo anchor, `genmove` advances KataGo's GTP board itself;
+  only send GTP `play` commands for Jev's moves. Reset board size, komi, rules,
+  and `rank_5k` parameters at each paired game. KataGo Chinese rules match this
+  app's simple ko, area scoring, and suicide-illegal behavior.

@@ -3,6 +3,8 @@ node_modules/
 
 # Logs and local dumps
 *.log
+benchmark-results*.jsonl
+.env
 
 # OS / editor
 .DS_Store
