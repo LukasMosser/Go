@@ -13,6 +13,7 @@ The initial pool is deliberately small and reproducible:
 | CLI name | Anchor | Role |
 | --- | --- | --- |
 | `greedy` | Current in-game one-ply heuristic | Reference anchor, assigned 1000 by convention |
+| `jev-scores` | Previous per-legal-move Jev candidate scorer | Direct baseline for MCTS; both variants use the live API model |
 | `choice-only` | Compact Choice-only policy from commit `6322135` | Historical Jev baseline; uses the same live API model and is version-stamped per game |
 | `noise25` | Current heuristic replaced by a random legal move on 25% of turns | Matchup sensitivity check |
 | `noise50` | Current heuristic replaced by a random legal move on 50% of turns | Matchup sensitivity check |
@@ -36,15 +37,20 @@ node benchmark.js --pairs 10
 node benchmark.js --pairs 10 --opponents greedy,choice-only
 node benchmark.js --pairs 20 --opponents greedy,noise25,noise50,random
 node benchmark.js --pairs 10 --opponents katago-5k
+node benchmark.js --bot mcts --mcts-simulations 8 --mcts-batch-size 4 \
+  --pairs 5 --seed 1 --opponents jev-scores,katago-5k
 ```
 
-By default, `--pairs 10` means 20 games against `local-greedy`: ten Jev-Black
+The default bot is MCTS. Use `--bot scores` to select the older
+candidate-scoring policy. By default, `--pairs 10` means 20 games against
+`local-greedy`: ten Jev-Black
 games and ten Jev-White games, paired by seed. Add opponents explicitly because
 each Jev turn can require many API calls. Results print as the run proceeds
 and are written to a unique `benchmark-results-*.jsonl` file (ignored by Git). Use
 `--output PATH` to choose a different file. Each record includes the seed,
 color, result, score margin, captures, passes, API calls, token usage, and
-resolved model name.
+resolved model name. MCTS records also include visits, evaluated positions,
+pass probability, and root value summaries.
 
 ### KataGo setup
 
@@ -67,10 +73,18 @@ suicide illegal). Per-game JSONL records include both model SHA-256 hashes and
 the resolved KataGo version. KataGo and the downloaded weights are local
 dependencies and are not stored in this repository.
 
-The single-pair setup pilot completed: Jev lost once as Black (−28.5 points)
-and once as White (−53.5), using 105 API calls total. That confirms the engine
-integration and color swap work; two games do not establish a useful strength
-estimate.
+The initial MCTS benchmark used five paired seeds (10 games per opponent),
+eight simulations per move, and batches of four. Against the previous Jev
+candidate scorer, MCTS scored 4–6 (mean margin −9.5; Elo difference −70,
+approximate 95% range −278 to +137). Against KataGo rank_5k it scored 2–8
+(mean margin −19.8; Elo difference −241, range −488 to +7). MCTS won no games
+as Black in either set. See README.md and DESIGN.md for the hard-pass-gate
+ablation, full token counts, and interpretation. These are small-sample
+head-to-head estimates, not calibrated Go ratings.
+
+On this Mac the runner overrides `metalDeviceToUseThread0=100`, which selects
+the Apple Neural Engine / CoreML backend. KataGo's packaged default GPU
+backend could not create a Metal device in this environment.
 
 ## Interpreting the rating
 

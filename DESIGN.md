@@ -6,32 +6,32 @@ decision model.
 
 ## Overview
 
-The player is Black; the machine is White. White is driven by Jev when
-an API key is available, with a local greedy heuristic as fallback when
-no key is set. The heuristic also drives Black in autoplay mode, so you
-can watch Jev's decisions against a greedy captures-and-liberties
-baseline. The local heuristic is deliberately kept simple — no sequence
-reading, no territory estimation — as a baseline for comparison.
+The player is Black; the machine is White. When an API key is available,
+Jev's decisions are wrapped in a low-budget MCTS: Jev supplies a move
+policy, a position-value estimate, and a pass judgment at evaluated nodes.
+Without a key, White uses the local greedy heuristic. In autoplay mode the
+same heuristic drives Black. It is deliberately simple — no sequence
+reading or territory estimation — and is only a local baseline.
 
 This design is inspired by, and follows the architecture of,
 [*Fight*](https://github.com/dagfinndybvig/Fight) — a one-on-one karate
 game in the same Arcade collection whose AI opponent is also driven by
-Jev. The Jev integration pattern (local CORS proxy, state text, `Choice`
-question, argmax move selection) and the autoplay and log-panel concepts
-originate there; this repo adapts them to Go's turn-based flow. Unlike
-Fight, Jev plays its best move here (argmax over the distribution)
-rather than a temperature-sampled one. There is no fallback on low
-confidence or errors — Jev retries instead. The only fallback is when
-no API key is set: the local heuristic plays White.
+Jev. The local CORS proxy, state text, typed questions, autoplay, and
+log-panel concepts originate there; this repo adapts them to Go's
+turn-based flow. The current game uses Choice probabilities as priors in
+PUCT and selects the root action with the most visits. There is no fallback
+on low confidence or errors — Jev retries instead. The local heuristic is
+used only when no API key is set.
 
 ### Why Jev is weak at Go
 
-Jev is a general-purpose decision model, not a dedicated Go engine. It
-receives a text description of the board and returns one move per turn
-— no search tree, no Monte Carlo playouts, no learned board evaluation.
-Dedicated Go AI (AlphaGo and its successors) needed deep neural
-networks trained on millions of self-play games plus tree search to
-reach human level; Jev has none of that machinery.
+Jev is a general-purpose decision model, not a dedicated Go engine. The
+game now adds an eight-simulation PUCT search, but its policy and value
+still come from Jev's text-based judgments; the search has no learned Go
+network, self-play training, or random rollouts. Dedicated Go AI such as
+AlphaGo and its successors combined trained neural networks with much
+deeper search. The Jev wrapper is a small experiment, not comparable
+compute or training.
 
 In earlier Go runs with tactical annotations, Jev's play showed three patterns:
 
@@ -47,11 +47,11 @@ In earlier Go runs with tactical annotations, Jev's play showed three patterns:
   many moves at 0.05–0.15. Jev itself is uncertain in most positions;
   high-confidence picks are almost always captures or atari saves.
 
-The earlier prompt included a mid-game territory estimate, group-in-danger
-scan, and 1-ply heuristic lookahead in each move description. The current
-compact-input experiment removes those derived annotations to measure
-whether Jev does better with the board, concise metadata, and bare legal
-move coordinates.
+The older candidate scorer included a mid-game territory estimate,
+group-in-danger scan, and 1-ply heuristic lookahead in each move
+description. The compact-state experiment removed those derived
+annotations; the current MCTS prompt retains the compact board and
+coordinate legend, then supplies the full legal set at each search node.
 
 #### Original 30-candidate benchmark
 
@@ -201,9 +201,87 @@ settings above are recorded so a future retained runner can reproduce the
 comparison.
 
 The local heuristic is also deliberately weak — one-ply greedy, no
-sequence reading, no life-and-death — so the two AIs are comparable in
-strength. Autoplay is a baseline AI benchmark: two limited approaches
-playing the same game, each showing what it can and cannot do.
+sequence reading, no life-and-death — so the earlier autoplay runs are
+baseline comparisons, not strong Go exhibitions.
+
+#### Jev-guided MCTS experiment
+
+The current policy asks Jev to evaluate positions rather than ask it to
+score every candidate move. It uses all three useful output primitives:
+
+- **Choice** supplies a probability distribution over the complete legal
+  move list (up to 81 points plus `pass`). Those probabilities are the
+  PUCT priors.
+- **Score** estimates the eventual area-score margin for the side represented
+  as White in that labeled position. Its nine ordered levels have indices
+  0–8, with level 4 approximately even. The expected Score is mapped to
+  `clamp(score / 4 - 1, -1, 1)` for MCTS value backup.
+- **Noul** estimates whether passing is sound. Its probability scales the
+  `pass` prior; it is guidance, not a hard veto in the selected policy.
+
+The root is queried first. Each simulation selects a leaf by PUCT using
+mean action value `Q` plus this exploration bonus:
+
+```text
+c_puct * prior * sqrt(parent visits + parent virtual visits + 1)
+         / (1 + edge visits + edge virtual visits)
+```
+
+Here `c_puct = 1.4`. The
+implementation reserves leaves to batch four distinct positions in one
+TypeSafe request. Every board is labeled `POSITION n` and
+has independent Choice, Score, and Noul questions. The tree alternates
+players by negating values during backup. It expands eight leaves per move
+by default; the next move starts a fresh tree. It does not preserve a tree
+between turns or perform random rollouts. Two consecutive passes use the
+game engine's exact terminal area score. The action with the most root
+visits is played; ties prefer higher mean value, then prior.
+
+When Jev plays actual Black in the benchmark, the harness swaps board
+colors and capture counts so Jev still appears as White. Komi ownership is
+also swapped and then maintained in every search child state. The benchmark
+uses 9x9 Chinese area scoring, 5.5 komi for actual White, simple ko, and
+color-swapped seed pairs. The TypeSafe alias resolved to `jev-1.13.0`;
+KataGo was `1.18.2+b18c384nbt-s9996M+b18c384nbt-humanv0`, its human-SL
+`rank_5k` profile, one visit, temperature 1. KataGo used the Metal CoreML /
+ANE backend (device 100) on this Mac.
+
+The selected **soft Noul-prior** run used eight simulations, batch size
+four, and seeds 1–5 (ten games per opponent):
+
+| Opponent | Jev W–D–L | Elo Δ (approx. 95% range) | Mean margin | Jev wins B/W | Mean plies | API calls | Input / output tokens |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Candidate-score Jev baseline | 4–0–6 | −70 (−278 to +137) | −9.5 | 0/5, 4/5 | 33.1 | 657 | 2,685,667 / 985,745 |
+| KataGo human-SL `rank_5k` | 2–0–8 | −241 (−488 to +7) | −19.8 | 0/5, 2/5 | 44.7 | 660 | 2,388,582 / 1,022,429 |
+
+The side split is stark: MCTS won no games as Black in either group. Against
+the candidate scorer it did best as White, often winning after short games;
+it passed 19 times in that ten-game cohort. Against KataGo, Jev passed 31
+times. The sample does not establish a stable Elo, but it did not show a
+strength improvement over the old Jev policy.
+
+I also ran a **hard Noul-gate ablation** on the same five paired seeds. It
+removed `pass` from each node's action set whenever the Noul probability was
+below 0.5, matching the previous score-based policy's threshold:
+
+| Opponent | Jev W–D–L | Elo Δ (approx. 95% range) | Mean margin | Jev wins B/W | Mean plies | API calls | Input / output tokens |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Candidate-score Jev baseline | 3–0–7 | −147 (−367 to +73) | −18.3 | 0/5, 3/5 | 63.1 | 1,257 | 4,720,230 / 1,647,866 |
+| KataGo human-SL `rank_5k` | 0–0–10 | −∞ (95% upper bound −166) | −50.1 | 0/5, 0/5 | 80.5 | 1,197 | 4,039,867 / 1,586,706 |
+
+The hard gate caused fewer passes and longer games (13 vs 19 passes against
+the score baseline; 20 vs 31 against KataGo), but scored worse and used
+substantially more API calls. The MCTS therefore keeps Noul as a soft prior.
+Both MCTS variants still lost every game as Black, so color handling or
+first-player/komi sensitivity deserves a separate investigation. Komi
+ownership was verified in the state normalization; the remaining asymmetry
+is empirical, not proof of a color-swap bug. These ten-game samples are
+diagnostic only. Reproduce with:
+
+```sh
+node benchmark.js --bot mcts --mcts-simulations 8 --mcts-batch-size 4 \
+  --pairs 5 --seed 1 --opponents jev-scores,katago-5k
+```
 
 ## Rules implementation
 
@@ -348,7 +426,11 @@ text. There is no fallback to the local heuristic.
   between attempts). If all retries fail, an error message is shown and
   no move is played — the game waits.
 
-#### State sent to Jev
+#### Historical candidate-scoring policy (benchmark baseline)
+
+The following describes the previous policy kept for head-to-head
+benchmarking. The browser's current policy is the Jev-guided MCTS described
+above.
 
 `buildEvaluationState()` assembles a compact text description plus
 candidate move deltas:

@@ -18,6 +18,7 @@ const DEFAULT_OPPONENTS = ['greedy'];
 
 function parseArgs(argv) {
   const out = {
+    bot: 'mcts', mctsSimulations: 8, mctsBatchSize: 4,
     pairs: 1, seed: 1, maxTurns: DEFAULT_MAX_TURNS, opponents: DEFAULT_OPPONENTS,
     output: null, katagoBin: process.env.KATAGO_BIN || 'katago',
     katagoModel: process.env.KATAGO_MODEL || '',
@@ -27,6 +28,9 @@ function parseArgs(argv) {
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === '--help' || arg === '-h') out.help = true;
+    else if (arg === '--bot') out.bot = argv[++i];
+    else if (arg === '--mcts-simulations') out.mctsSimulations = Number(argv[++i]);
+    else if (arg === '--mcts-batch-size') out.mctsBatchSize = Number(argv[++i]);
     else if (arg === '--pairs') out.pairs = Number(argv[++i]);
     else if (arg === '--seed') out.seed = Number(argv[++i]);
     else if (arg === '--max-turns') out.maxTurns = Number(argv[++i]);
@@ -41,7 +45,10 @@ function parseArgs(argv) {
   if (!out.help && (!Number.isInteger(out.pairs) || out.pairs < 1)) throw new Error('--pairs must be a positive integer');
   if (!out.help && (!Number.isInteger(out.seed) || out.seed < 0)) throw new Error('--seed must be a non-negative integer');
   if (!out.help && (!Number.isInteger(out.maxTurns) || out.maxTurns < 2)) throw new Error('--max-turns must be an integer >= 2');
-  const known = new Set(['choice-only', 'greedy', 'noise25', 'noise50', 'random', 'katago-5k']);
+  const known = new Set(['jev-scores', 'choice-only', 'greedy', 'noise25', 'noise50', 'random', 'katago-5k']);
+  if (!out.help && !['mcts', 'scores'].includes(out.bot)) throw new Error('--bot must be mcts or scores');
+  if (!out.help && (!Number.isInteger(out.mctsSimulations) || out.mctsSimulations < 1)) throw new Error('--mcts-simulations must be a positive integer');
+  if (!out.help && (!Number.isInteger(out.mctsBatchSize) || out.mctsBatchSize < 1)) throw new Error('--mcts-batch-size must be a positive integer');
   if (!out.help && (!out.opponents.length || out.opponents.some(name => !known.has(name)))) {
     throw new Error('Opponents must be selected from: ' + [...known].join(', '));
   }
@@ -51,13 +58,16 @@ function parseArgs(argv) {
 function printHelp() {
   console.log(`Usage: node benchmark.js [options]
 
-Run Jev against fixed local opponent anchors. Every pair is two games from
+Run the selected Jev bot against fixed anchors. Every pair is two games from
 the same seed, with the players swapping Black and White.
 
 Options:
+  --bot NAME                mcts or scores (default: mcts)
+  --mcts-simulations N      PUCT leaf expansions per move (default: 8)
+  --mcts-batch-size N       Leaf states evaluated together (default: 4)
   --pairs N                 Color-swapped pairs per opponent (default: 1)
   --seed N                  First deterministic seed (default: 1)
-  --opponents LIST          Comma-separated: choice-only,greedy,noise25,
+  --opponents LIST          Comma-separated: jev-scores,choice-only,greedy,noise25,
                             noise50,random,katago-5k (default: ${DEFAULT_OPPONENTS.join(',')})
   --max-turns N             Ply cap per game (default: 600)
   --output FILE             Write per-game JSONL (default: unique timestamped file)
@@ -114,8 +124,12 @@ function sha256File(filename) {
 }
 
 class GtpProcess {
-  constructor(command, args) {
-    this.child = spawn(command, args, { cwd: os.tmpdir(), stdio: ['pipe', 'pipe', 'pipe'] });
+  constructor(command, args, extraEnv = {}) {
+    this.child = spawn(command, args, {
+      cwd: os.tmpdir(),
+      env: { ...process.env, ...extraEnv },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
     this.nextId = 1;
     this.pending = null;
     this.stderr = '';
@@ -186,14 +200,19 @@ class GtpProcess {
 
 async function startKataGo(options) {
   const files = resolveKataGoFiles(options);
+  const tempDir = path.join(ROOT, '.tmp-katago');
+  fs.rmSync(tempDir, { recursive: true, force: true });
+  fs.mkdirSync(tempDir, { recursive: true });
   const engine = new GtpProcess(options.katagoBin, [
     'gtp', '-config', files.config, '-model', files.model, '-human-model', files.humanModel,
-  ]);
+    '-override-config', 'metalDeviceToUseThread0=100',
+  ], { TMPDIR: tempDir });
   try {
     await engine.command('protocol_version');
     const version = await engine.command('version');
     const metadata = {
       version,
+      backend: 'Metal CoreML/ANE (device 100)',
       profile: 'rank_5k',
       visits: 1,
       chosenMoveTemperatureEarly: 1,
@@ -237,10 +256,14 @@ async function startKataGo(options) {
       async play(color, move) {
         await engine.command('play ' + (color === 1 ? 'B' : 'W') + ' ' + move);
       },
-      close: () => engine.close(),
+      async close() {
+        try { await engine.close(); }
+        finally { fs.rmSync(tempDir, { recursive: true, force: true }); }
+      },
     };
   } catch (error) {
     await engine.close();
+    fs.rmSync(tempDir, { recursive: true, force: true });
     throw error;
   }
 }
@@ -275,7 +298,7 @@ function loadGame(apiKey) {
       captures: { ...captures },
       lastMove: lastMove ? lastMove.map(row => row.slice()) : null,
       lastCoord: lastCoord ? { ...lastCoord } : null,
-      jevLastChoice, passes, turn, gameOver,
+      jevLastChoice, passes, turn, gameOver, komiColor: jevKomiColor,
     };
   },
   setState(s) {
@@ -286,6 +309,7 @@ function loadGame(apiKey) {
     jevLastChoice = s.jevLastChoice || null;
     passes = s.passes || 0;
     turn = s.turn || BLACK;
+    jevKomiColor = s.komiColor || WHITE;
     gameOver = !!s.gameOver;
   },
 };
@@ -396,6 +420,7 @@ function randomAnchor(moves, rng) {
   return moves.length ? { move: moves[Math.floor(rng() * moves.length)] } : { pass: true };
 }
 function makeAnchor(name) {
+  if (name === 'jev-scores') return { id: 'jev-candidate-scores', description: 'Previous Jev policy with per-legal-move Scores and a Noul pass gate.', kind: 'score', noise: 0 };
   if (name === 'choice-only') return { id: 'compact-choice-only', description: 'Earlier compact one-Choice Jev policy.', kind: 'choice-only', noise: 0 };
   if (name === 'greedy') return { id: 'local-greedy', description: 'The game’s current one-ply heuristic.', noise: 0 };
   if (name === 'noise25') return { id: 'local-greedy-25pct-random', description: 'Current heuristic, replaced by a uniform legal move on 25% of turns.', noise: 0.25 };
@@ -465,7 +490,11 @@ async function withCanonicalJevState(runtime, state, legal, color, ownLastMove, 
   const candidateMoves = canonical
     ? legal.map(move => ({ ...move, board: swapColors(move.board) }))
     : legal;
-  const promptState = { ...state, jevLastChoice: ownLastMove || null };
+  const promptState = {
+    ...state,
+    jevLastChoice: ownLastMove || null,
+    komiColor: canonical ? engine.BLACK : engine.WHITE,
+  };
   if (canonical) {
     engine.setState({
       ...promptState,
@@ -501,6 +530,19 @@ async function chooseScoringJev(runtime, state, legal, color, ownLastMove) {
   if (selected === 'pass') return { pass: true };
   const found = legal.find(move => engine.coordName(move.x, move.y) === selected);
   if (!found) throw new Error('Jev returned a non-legal move: ' + selected);
+  return { move: found };
+}
+
+async function chooseMctsJev(runtime, state, legal, color, ownLastMove, options) {
+  const engine = runtime.engine;
+  const selected = await withCanonicalJevState(runtime, state, legal, color, ownLastMove,
+    moves => retryApiCall(() => engine.Jev.chooseMctsMove(moves, {
+      simulations: options.mctsSimulations,
+      batchSize: options.mctsBatchSize,
+    })));
+  if (selected === 'pass') return { pass: true };
+  const found = legal.find(move => engine.coordName(move.x, move.y) === selected);
+  if (!found) throw new Error('MCTS Jev returned a non-legal move: ' + selected);
   return { move: found };
 }
 
@@ -550,7 +592,7 @@ async function chooseCompactChoiceJev(runtime, state, legal, color, ownLastMove)
   return { move: found };
 }
 
-async function playGame(runtime, opponent, jevColor, seed, maxTurns, kataGo) {
+async function playGame(runtime, botKind, opponent, jevColor, seed, options, kataGo) {
   const e = runtime.engine;
   if (opponent.kind === 'katago') await kataGo.newGame();
   let state = {
@@ -570,11 +612,11 @@ async function playGame(runtime, opponent, jevColor, seed, maxTurns, kataGo) {
   runtime.resetApiUsage();
   e.Jev.clearLog();
 
-  while (turns < maxTurns && state.passes < 2) {
+  while (turns < options.maxTurns && state.passes < 2) {
     const color = state.turn;
     const legal = e.legalMoves(state.board, color, state.lastMove);
     let decision;
-    const actor = color === jevColor ? { id: 'jev', kind: 'score' } : opponent;
+    const actor = color === jevColor ? { id: 'jev', kind: botKind } : opponent;
     if (legal.length === 0) {
       decision = { pass: true };
       if (actor.kind === 'katago') await kataGo.play(color, 'pass');
@@ -582,6 +624,8 @@ async function playGame(runtime, opponent, jevColor, seed, maxTurns, kataGo) {
     else if (actor.kind === 'score') {
       runtime.setRandom(randomByPlayer[actor.id]);
       decision = await chooseScoringJev(runtime, state, legal, color, lastMoveByPlayer[actor.id]);
+    } else if (actor.kind === 'mcts') {
+      decision = await chooseMctsJev(runtime, state, legal, color, lastMoveByPlayer[actor.id], options);
     } else if (actor.kind === 'choice-only') {
       runtime.setRandom(randomByPlayer[actor.id]);
       decision = await chooseCompactChoiceJev(runtime, state, legal, color, lastMoveByPlayer[actor.id]);
@@ -603,7 +647,7 @@ async function playGame(runtime, opponent, jevColor, seed, maxTurns, kataGo) {
       await kataGo.play(color, decision.pass ? 'pass' : e.coordName(decision.move.x, decision.move.y));
     }
     if (decision.resign) { resignedBy = color; break; }
-    if (actor.kind === 'score' || actor.kind === 'choice-only') {
+    if (actor.kind === 'score' || actor.kind === 'mcts' || actor.kind === 'choice-only') {
       lastMoveByPlayer[actor.id] = decision.pass ? null : e.coordName(decision.move.x, decision.move.y);
     }
     if (decision.pass) {
@@ -631,6 +675,7 @@ async function playGame(runtime, opponent, jevColor, seed, maxTurns, kataGo) {
     : jevScore > opponentScore;
   const draw = resignedBy == null && jevScore === opponentScore;
   const log = e.Jev.getLog();
+  const mctsLog = log.filter(item => item.mcts);
   const usageEvents = [
     ...log.map(item => ({ model: item.model, usage: item.usage })),
     ...runtime.getApiUsage(),
@@ -642,7 +687,16 @@ async function playGame(runtime, opponent, jevColor, seed, maxTurns, kataGo) {
     totals.output += Number(usage.output_tokens || usage.completion_tokens || 0);
     return totals;
   }, { input: 0, output: 0 });
+  const mctsSummary = mctsLog.length ? {
+    decisions: mctsLog.length,
+    passes: mctsLog.filter(item => item.choice === 'pass').length,
+    meanRootPassProbability: mctsLog.reduce((sum, item) => sum + Number(item.passProbability || 0), 0) / mctsLog.length,
+    meanRootValue: mctsLog.reduce((sum, item) => sum + Number(item.positionValue || 0), 0) / mctsLog.length,
+    simulations: mctsLog.reduce((sum, item) => sum + Number(item.simulations || 0), 0),
+    evaluatedPositions: mctsLog.reduce((sum, item) => sum + Number(item.evaluatedPositions || 0), 0),
+  } : null;
   return {
+    bot: botKind,
     opponent: opponent.id,
     opponentModel: opponent.kind === 'katago' ? kataGo.metadata.version : null,
     opponentDetails: opponent.kind === 'katago' ? kataGo.metadata : null,
@@ -661,6 +715,7 @@ async function playGame(runtime, opponent, jevColor, seed, maxTurns, kataGo) {
     jevPasses: passCounts[jevColor],
     opponentPasses: passCounts[colors.opponent],
     apiCalls: runtime.getApiRequests(),
+    mcts: mctsSummary,
     inputTokens: tokens.input,
     outputTokens: tokens.output,
     models,
@@ -693,13 +748,13 @@ async function main() {
       for (let pair = 0; pair < options.pairs; pair++) {
         const seed = options.seed + pair;
         for (const jevColor of [runtime.engine.BLACK, runtime.engine.WHITE]) {
-          const record = await playGame(runtime, opponent, jevColor, seed, options.maxTurns, kataGo);
+          const record = await playGame(runtime, options.bot, opponent, jevColor, seed, options, kataGo);
           record.pair = opponent.id + ':' + seed;
           records.push(record);
           fs.appendFileSync(outputPath, JSON.stringify(record) + '\n');
           gameNumber++;
           console.log(
-            '[' + gameNumber + '] Jev ' + record.jevColor + ' vs ' + opponent.id + ': ' +
+            '[' + gameNumber + '] Jev ' + options.bot + ' ' + record.jevColor + ' vs ' + opponent.id + ': ' +
             record.result + ', ' + record.turns + ' plies, margin ' + record.jevMargin.toFixed(1) +
             ', API calls ' + record.apiCalls + (record.finished ? '' : record.terminal === 'opponent resigned' ? ' (resignation)' : ' (turn cap)')
           );
